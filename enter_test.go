@@ -3,11 +3,12 @@ package pan_client
 import (
 	"encoding/json"
 	"fmt"
+	"testing"
+
 	"github.com/hefeiyu2025/pan-client/internal"
 	"github.com/hefeiyu2025/pan-client/pan"
 	"github.com/hefeiyu2025/pan-client/pan/driver/thunder_browser"
 	logger "github.com/sirupsen/logrus"
-	"testing"
 )
 
 func TestDownloadAndUpload(t *testing.T) {
@@ -253,6 +254,97 @@ func TestShareRestore(t *testing.T) {
 	if err != nil {
 		t.Error(err)
 		return
+	}
+}
+
+// TestDownloadByFilePath 夸克网盘指定文件路径下载测试
+func TestDownloadByFilePath(t *testing.T) {
+	defer GracefulExist()
+	client, err := GetClient(pan.Quark)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+
+	remoteFilePath := "/来自：分享/BY.4k/02.4k.mp4"
+	localSavePath := "./tmpdata"
+
+	lastSlash := len(remoteFilePath) - 1
+	for lastSlash >= 0 && remoteFilePath[lastSlash] != '/' {
+		lastSlash--
+	}
+	parentPath := remoteFilePath[:lastSlash]
+	fileName := remoteFilePath[lastSlash+1:]
+
+	list, err := client.List(pan.ListReq{
+		Dir: &pan.PanObj{
+			Path: parentPath,
+			Type: "dir",
+		},
+		Reload: true,
+	})
+	if err != nil {
+		t.Errorf("获取目录列表失败: %v", err)
+		return
+	}
+
+	var targetFile *pan.PanObj
+	for _, item := range list {
+		if item.Type == "file" && item.Name == fileName {
+			targetFile = item
+			break
+		}
+	}
+
+	if targetFile == nil {
+		t.Errorf("未找到文件: %s", remoteFilePath)
+		return
+	}
+
+	err = client.DownloadFile(pan.DownloadFileReq{
+		RemoteFile:  targetFile,
+		LocalPath:   localSavePath,
+		Concurrency: 10,
+		ChunkSize:   5 * 1024 * 1024,
+		OverCover:   true,
+		DownloadCallback: func(localPath, localFile string) {
+			logger.Infof("下载完成: %s/%s", localPath, localFile)
+		},
+	})
+	if err != nil {
+		t.Errorf("下载失败: %v", err)
+		return
+	}
+	logger.Info("文件下载成功")
+}
+
+// TestListDir 夸克网盘查看目录下文件
+func TestListDir(t *testing.T) {
+	defer GracefulExist()
+	client, err := GetClient(pan.Quark)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+
+	// 配置：修改为你要查看的目录路径
+	dirPath := "/来自：分享/BY.4k"
+
+	list, err := client.List(pan.ListReq{
+		Dir: &pan.PanObj{
+			Path: dirPath,
+			Type: "dir",
+		},
+		Reload: true,
+	})
+	if err != nil {
+		t.Errorf("获取目录列表失败: %v", err)
+		return
+	}
+
+	logger.Infof("目录 %s 下共有 %d 个文件/文件夹:", dirPath, len(list))
+	for i, item := range list {
+		logger.Infof("[%d] %s (%s) - %s", i+1, item.Name, item.Type, item.Path)
 	}
 }
 
