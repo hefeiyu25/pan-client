@@ -1,7 +1,7 @@
 package cloudreve
 
 import (
-	"github.com/hefeiyu2025/pan-client/pan"
+	"github.com/hefeiyu25/pan-client/pan"
 	"github.com/imroc/req/v3"
 	"net/http"
 	"net/url"
@@ -391,7 +391,7 @@ func (c *Cloudreve) oneDriveCallback(sessionId string) (*Resp, pan.DriverErrorIn
 func (c *Cloudreve) oneDriveUpload(req OneDriveUploadReq) (int64, pan.DriverErrorInterface) {
 	uploadedSize := req.UploadedSize
 
-	pr, err := pan.NewProcessReader(req.LocalFile, req.ChunkSize, uploadedSize)
+	pr, err := pan.NewProcessReader(req.LocalFile, req.ChunkSize, uploadedSize, req.ProgressCallback)
 	if err != nil {
 		return uploadedSize, err
 	}
@@ -419,7 +419,7 @@ func (c *Cloudreve) oneDriveUpload(req OneDriveUploadReq) (int64, pan.DriverErro
 
 func (c *Cloudreve) notKnowUpload(req NotKnowUploadReq) (int64, pan.DriverErrorInterface) {
 	uploadedSize := req.UploadedSize
-	pr, err := pan.NewProcessReader(req.LocalFile, req.ChunkSize, uploadedSize)
+	pr, err := pan.NewProcessReader(req.LocalFile, req.ChunkSize, uploadedSize, req.ProgressCallback)
 	if err != nil {
 		return uploadedSize, err
 	}

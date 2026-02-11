@@ -3,10 +3,9 @@ package cloudreve
 import (
 	"fmt"
 	"github.com/google/uuid"
-	"github.com/hefeiyu2025/pan-client/internal"
-	"github.com/hefeiyu2025/pan-client/pan"
+	"github.com/hefeiyu25/pan-client/internal"
+	"github.com/hefeiyu25/pan-client/pan"
 	"github.com/imroc/req/v3"
-	logger "github.com/sirupsen/logrus"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -51,13 +50,8 @@ func (cp *CloudreveProperties) GetDriverType() pan.DriverType {
 }
 
 func (c *Cloudreve) Init() (string, error) {
-	err := c.ReadConfig()
-	if err != nil {
-		return "", err
-	}
 	driverId := c.GetId()
 	if c.Properties.Url == "" || c.Properties.Session == "" {
-		_ = c.WriteConfig()
 		return driverId, fmt.Errorf("please set cloudreve url and session")
 	}
 	c.sessionClient = req.C().SetCommonHeader(HeaderUserAgent, DefaultUserAgent).
@@ -69,7 +63,7 @@ func (c *Cloudreve) Init() (string, error) {
 	}
 	if len(c.Properties.OtherCookies) > 0 {
 		for k, v := range c.Properties.OtherCookies {
-			logger.Info(k, v)
+			internal.GetLogger().Info("set cookie", "name", k, "value", v)
 			c.sessionClient.SetCommonCookies(&http.Cookie{Name: k, Value: v})
 		}
 	}
@@ -88,28 +82,20 @@ func (c *Cloudreve) Init() (string, error) {
 		})
 	// 若一小时内更新过，则不重新刷session
 	if c.Properties.RefreshTime == 0 || time.Now().UnixMilli()-c.Properties.RefreshTime > 60*60*1000 {
-		_, err = c.config()
-		if err != nil {
-			return driverId, err
-		} else {
-			err = c.WriteConfig()
-			if err != nil {
-				return driverId, err
-			}
+		_, configErr := c.config()
+		if configErr != nil {
+			return driverId, configErr
 		}
+		c.Properties.RefreshTime = time.Now().UnixMilli()
+		c.NotifyChange()
 	}
 	return driverId, nil
 }
 
-func (c *Cloudreve) InitByCustom(id string, read pan.ConfigRW, write pan.ConfigRW) (string, error) {
-	c.Properties = &CloudreveProperties{Id: id}
-	c.PropertiesOperate.Write = write
-	c.PropertiesOperate.Read = read
-	return c.Init()
-}
-
-func (c *Cloudreve) Drop() error {
-	return pan.OnlyMsg("not support")
+func (c *Cloudreve) Close() error {
+	c.Cancel()
+	c.StopCache()
+	return nil
 }
 
 func (c *Cloudreve) Disk() (*pan.DiskResp, error) {
@@ -131,10 +117,10 @@ func (c *Cloudreve) List(req pan.ListReq) ([]*pan.PanObj, error) {
 	if req.Reload {
 		c.Del(cacheKey)
 	}
-	panObjs, exist, err := c.GetOrDefault(cacheKey, func() (interface{}, error) {
+	result, err := c.GetOrLoad(cacheKey, func() (interface{}, error) {
 		directory, e := c.listDirectory(strings.TrimRight(req.Dir.Path, "/") + "/" + req.Dir.Name)
 		if e != nil {
-			logger.Error(e)
+			internal.GetLogger().Error("list directory error", "error", e)
 			return nil, e
 		}
 		panObjs := make([]*pan.PanObj, 0)
@@ -154,11 +140,8 @@ func (c *Cloudreve) List(req pan.ListReq) ([]*pan.PanObj, error) {
 	if err != nil {
 		return make([]*pan.PanObj, 0), err
 	}
-	if exist {
-		objs, ok := panObjs.([]*pan.PanObj)
-		if ok {
-			return objs, nil
-		}
+	if objs, ok := result.([]*pan.PanObj); ok {
+		return objs, nil
 	}
 	return make([]*pan.PanObj, 0), nil
 }
@@ -190,36 +173,7 @@ func (c *Cloudreve) ObjRename(req pan.ObjRenameReq) error {
 	return nil
 }
 func (c *Cloudreve) BatchRename(req pan.BatchRenameReq) error {
-	objs, err := c.List(pan.ListReq{
-		Reload: true,
-		Dir:    req.Path,
-	})
-	if err != nil {
-		return err
-	}
-	for _, object := range objs {
-		if object.Type == "dir" {
-			err = c.BatchRename(pan.BatchRenameReq{
-				Path: object,
-				Func: req.Func,
-			})
-			if err != nil {
-				return err
-			}
-		}
-		newName := req.Func(object)
-
-		if newName != object.Name {
-			err = c.ObjRename(pan.ObjRenameReq{
-				Obj:     object,
-				NewName: newName,
-			})
-			if err != nil {
-				return err
-			}
-		}
-	}
-	return nil
+	return c.BaseBatchRename(req, c.List, c.ObjRename, c.BatchRename)
 }
 func (c *Cloudreve) Mkdir(req pan.MkdirReq) (*pan.PanObj, error) {
 	if req.NewPath == "" {
@@ -393,10 +347,13 @@ func (c *Cloudreve) UploadPath(req pan.UploadPathReq) error {
 
 func (c *Cloudreve) uploadErrAfter(md5Key string, uploadedSize int64, session UploadCredential) {
 	c.Set(cacheChunkPrefix+md5Key, uploadedSize)
-	errorTimes, _, _ := c.GetOrDefault(cacheSessionErrPrefix+md5Key, func() (interface{}, error) {
+	errorTimesVal, err := c.GetOrLoad(cacheSessionErrPrefix+md5Key, func() (interface{}, error) {
 		return 0, nil
 	})
-	i := errorTimes.(int)
+	if err != nil {
+		errorTimesVal = 0
+	}
+	i := errorTimesVal.(int)
 	if i > 3 {
 		if session.SessionID != "" {
 			_, _ = c.fileUploadDeleteUploadSession(session.SessionID)
@@ -449,7 +406,7 @@ func (c *Cloudreve) UploadFile(req pan.UploadFileReq) error {
 		uploadedSize = obj.(int64)
 	}
 	var session UploadCredential
-	data, exist, e := c.GetOrDefault(cacheSessionPrefix+md5Key, func() (interface{}, error) {
+	data, e := c.GetOrLoad(cacheSessionPrefix+md5Key, func() (interface{}, error) {
 		policy, exist := c.Get(cachePolicy)
 		if !exist {
 			return nil, pan.OnlyMsg(cachePolicy + " is not exist")
@@ -485,17 +442,18 @@ func (c *Cloudreve) UploadFile(req pan.UploadFileReq) error {
 	if e != nil {
 		return e
 	}
-	if exist {
+	if data != nil {
 		session = data.(UploadCredential)
 	}
 	switch c.Properties.Type {
 	case Now61, Yiandrive, Wuaipan:
 		uploadedSize, err = c.notKnowUpload(NotKnowUploadReq{
-			UploadUrl:    session.UploadURLs[0],
-			Credential:   session.Credential,
-			LocalFile:    req.LocalFile,
-			UploadedSize: uploadedSize,
-			ChunkSize:    int64(session.ChunkSize),
+			UploadUrl:        session.UploadURLs[0],
+			Credential:       session.Credential,
+			LocalFile:        req.LocalFile,
+			UploadedSize:     uploadedSize,
+			ChunkSize:        int64(session.ChunkSize),
+			ProgressCallback: req.ProgressCallback,
 		})
 		if err != nil {
 			c.uploadErrAfter(md5Key, uploadedSize, session)
@@ -503,10 +461,11 @@ func (c *Cloudreve) UploadFile(req pan.UploadFileReq) error {
 		}
 	case Huang1111, Hefamily, Hucl:
 		uploadedSize, err = c.oneDriveUpload(OneDriveUploadReq{
-			UploadUrl:    session.UploadURLs[0],
-			LocalFile:    req.LocalFile,
-			UploadedSize: uploadedSize,
-			ChunkSize:    min(int64(session.ChunkSize), c.Properties.ChunkSize),
+			UploadUrl:        session.UploadURLs[0],
+			LocalFile:        req.LocalFile,
+			UploadedSize:     uploadedSize,
+			ChunkSize:        min(int64(session.ChunkSize), c.Properties.ChunkSize),
+			ProgressCallback: req.ProgressCallback,
 		})
 		if err != nil {
 			c.uploadErrAfter(md5Key, uploadedSize, session)
@@ -527,14 +486,14 @@ func (c *Cloudreve) UploadFile(req pan.UploadFileReq) error {
 		c.Del(cacheChunkPrefix + md5Key)
 		c.Del(cacheSessionErrPrefix + md5Key)
 	}
-	logger.Infof("upload success %s", req.LocalFile)
+	internal.GetLogger().Info("upload success", "file", req.LocalFile)
 	// 上传成功则移除文件了
 	if req.SuccessDel {
 		err = os.Remove(req.LocalFile)
 		if err != nil {
-			logger.Errorf("delete fail %s,%v", req.LocalFile, err)
+			internal.GetLogger().Error("delete fail", "file", req.LocalFile, "error", err)
 		} else {
-			logger.Infof("delete success %s", req.LocalFile)
+			internal.GetLogger().Info("delete success", "file", req.LocalFile)
 		}
 
 	}
@@ -607,7 +566,7 @@ func init() {
 			PropertiesOperate: pan.PropertiesOperate[*CloudreveProperties]{
 				DriverType: pan.Cloudreve,
 			},
-			CacheOperate:  pan.CacheOperate{DriverType: pan.Cloudreve},
+			CacheOperate:  pan.NewCacheOperate(),
 			CommonOperate: pan.CommonOperate{},
 		}
 	})

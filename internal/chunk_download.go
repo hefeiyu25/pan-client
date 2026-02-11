@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"github.com/imroc/req/v3"
-	logger "github.com/sirupsen/logrus"
 	"io"
 	urlpkg "net/url"
 	"os"
@@ -17,38 +16,24 @@ import (
 	"time"
 )
 
-var shutdown = false
-var runningMap = make(map[*ChunkDownload]bool)
-var downloadMaxChan chan struct{}
+var (
+	runningMu  sync.RWMutex
+	runningMap = make(map[*ChunkDownload]bool)
+)
 
-func InitChunkDownload() {
-	downloadMaxChan = make(chan struct{}, Config.Server.DownloadMaxThread)
-	go func() {
-		for {
-			// 判断是否已经关闭
-			if shutdown {
-				// 等待所有的下载器完成
-				i := len(runningMap)
-				if i == 0 {
-					ExitWaitGroup.Done()
-					break
-				}
-				// 休眠
-				time.Sleep(500 * time.Millisecond)
-				continue
-			}
-			select {
-			case <-ChunkExitChan:
-				shutdown = true
-			}
-		}
-	}()
+func isShutdown() bool {
+	return GlobalContext().Err() != nil
 }
+
+// ProgressFunc 下载进度回调，签名与 pan.ProgressCallback 一致
+type ProgressFunc func(fileName string, operated, totalSize int64, percent, speed float64, done bool)
 
 type ChunkDownload struct {
 	url             string
 	client          *req.Client
 	concurrency     int
+	maxRetry        int
+	maxThread       int
 	output          io.Writer
 	filename        string
 	outputDirectory string
@@ -56,6 +41,7 @@ type ChunkDownload struct {
 	chunkSize       int64
 	tempRootDir     string
 	tempDir         string
+	semaphore       chan struct{}
 	taskCh          chan *downloadTask
 	doneCh          chan struct{}
 	wgDoneCh        chan struct{}
@@ -66,6 +52,7 @@ type ChunkDownload struct {
 	mu              sync.Mutex
 	lastIndex       int
 	pw              *progressWriter
+	progressFunc    ProgressFunc
 }
 
 func NewChunkDownload(url string, client *req.Client) *ChunkDownload {
@@ -73,6 +60,12 @@ func NewChunkDownload(url string, client *req.Client) *ChunkDownload {
 		url:    url,
 		client: client,
 	}
+}
+
+// SetProgressFunc 设置下载进度回调
+func (pd *ChunkDownload) SetProgressFunc(fn ProgressFunc) *ChunkDownload {
+	pd.progressFunc = fn
+	return pd
 }
 
 func (pd *ChunkDownload) completeTask(task *downloadTask) {
@@ -87,21 +80,31 @@ func (pd *ChunkDownload) completeTask(task *downloadTask) {
 	}()
 }
 
-func (pd *ChunkDownload) popTask(index int) *downloadTask {
+func (pd *ChunkDownload) popTask(index int) (*downloadTask, bool) {
 	pd.mu.Lock()
 	if task, ok := pd.taskMap[index]; ok {
 		delete(pd.taskMap, index)
 		pd.mu.Unlock()
-		return task
+		return task, true
 	}
 	pd.mu.Unlock()
 	for {
-		task := <-pd.taskNotifyCh
-		if task.index == index {
+		select {
+		case task := <-pd.taskNotifyCh:
+			if task.index == index {
+				pd.mu.Lock()
+				delete(pd.taskMap, index)
+				pd.mu.Unlock()
+				return task, true
+			}
+			// put non-matching task back into taskMap
 			pd.mu.Lock()
-			delete(pd.taskMap, index)
+			pd.taskMap[task.index] = task
 			pd.mu.Unlock()
-			return task
+		case <-pd.doneCh:
+			return nil, false
+		case <-GlobalContext().Done():
+			return nil, false
 		}
 	}
 }
@@ -116,8 +119,15 @@ func (pd *ChunkDownload) ensure() error {
 	}
 	if pd.tempRootDir == "" {
 		pd.tempRootDir = os.TempDir()
-		//pd.tempRootDir = "./tmp"
 	}
+	if pd.maxRetry <= 0 {
+		pd.maxRetry = 3
+	}
+	if pd.maxThread <= 0 {
+		pd.maxThread = 50
+	}
+	pd.semaphore = make(chan struct{}, pd.maxThread)
+
 	fullPath, err := filepath.Abs(pd.filename)
 	if err != nil {
 		return err
@@ -137,9 +147,10 @@ func (pd *ChunkDownload) ensure() error {
 	pd.taskNotifyCh = make(chan *downloadTask)
 
 	pd.pw = &progressWriter{
-		totalSize: pd.totalBytes,
-		fileName:  pd.filename,
-		startTime: time.Now(),
+		totalSize:    pd.totalBytes,
+		fileName:     pd.filename,
+		startTime:    time.Now(),
+		progressFunc: pd.progressFunc,
 	}
 	return nil
 }
@@ -180,6 +191,16 @@ func (pd *ChunkDownload) SetOutputDirectory(outputDirectory string) *ChunkDownlo
 	return pd
 }
 
+func (pd *ChunkDownload) SetMaxRetry(n int) *ChunkDownload {
+	pd.maxRetry = n
+	return pd
+}
+
+func (pd *ChunkDownload) SetMaxThread(n int) *ChunkDownload {
+	pd.maxThread = n
+	return pd
+}
+
 func getRangeTempFile(rangeStart, rangeEnd int64, workerDir string) string {
 	return filepath.Join(workerDir, fmt.Sprintf("temp-%d-%d", rangeStart, rangeEnd))
 }
@@ -217,7 +238,7 @@ type downloadTask struct {
 func (pd *ChunkDownload) handleTask(t *downloadTask, ctx ...context.Context) {
 	pd.wg.Add(1)
 	defer pd.wg.Done()
-	if shutdown {
+	if isShutdown() {
 		return
 	}
 	if t.completed {
@@ -232,19 +253,25 @@ func (pd *ChunkDownload) handleTask(t *downloadTask, ctx ...context.Context) {
 		return
 	}
 	cpr := &chunkProgressWriter{
-		startTime: time.Now(),
-		fileName:  t.tempFilename,
+		startTime:    time.Now(),
+		fileName:     t.tempFilename,
+		progressFunc: pd.progressFunc,
 	}
-	resp, er := pd.client.R().
+	r := pd.client.R().
 		SetHeader("Range", fmt.Sprintf("bytes=%d-%d", t.rangeStart, t.rangeEnd)).
 		SetOutput(file).
-		SetDownloadCallback(cpr.downloadCallback).
-		Get(pd.url)
+		SetDownloadCallback(cpr.downloadCallback)
+	if len(ctx) > 0 && ctx[0] != nil {
+		r = r.SetContext(ctx[0])
+	}
+	resp, er := r.Get(pd.url)
 	if er != nil {
+		file.Close()
 		go pd.retry(t, er)
 		return
 	}
 	if resp.IsErrorState() {
+		file.Close()
 		go pd.retry(t, fmt.Errorf("request error: %s", resp.String()))
 		return
 	}
@@ -254,8 +281,8 @@ func (pd *ChunkDownload) handleTask(t *downloadTask, ctx ...context.Context) {
 }
 
 func (pd *ChunkDownload) retry(t *downloadTask, err error) {
-	if t.retry < Config.Server.DownloadMaxThread {
-		logger.WithError(err).Errorf("task %s exist error:%s", t.tempFilename, err)
+	if t.retry < pd.maxRetry {
+		GetLogger().Error("task error", "task", t.tempFilename, "error", err)
 		t.retry += 1
 		pd.taskCh <- t
 	} else {
@@ -264,17 +291,22 @@ func (pd *ChunkDownload) retry(t *downloadTask, err error) {
 }
 
 func (pd *ChunkDownload) startWorker(ctx ...context.Context) {
+	gCtx := GlobalContext()
+	var clientDone <-chan struct{}
+	if len(ctx) > 0 && ctx[0] != nil {
+		clientDone = ctx[0].Done()
+	}
 	for {
-		if shutdown {
-			pd.errCh <- errors.New("service is shutdown")
-			return
-		}
 		select {
 		case t := <-pd.taskCh:
-			downloadMaxChan <- struct{}{}
+			pd.semaphore <- struct{}{}
 			pd.handleTask(t, ctx...)
-			<-downloadMaxChan
+			<-pd.semaphore
 		case <-pd.doneCh:
+			return
+		case <-gCtx.Done():
+			return
+		case <-clientDone:
 			return
 		}
 	}
@@ -287,11 +319,18 @@ func (pd *ChunkDownload) mergeFile() {
 		pd.errCh <- err
 		return
 	}
+	if closer, ok := file.(io.Closer); ok {
+		defer closer.Close()
+	}
 	for i := 0; ; i++ {
-		if shutdown {
+		if isShutdown() {
 			return
 		}
-		task := pd.popTask(i)
+		task, ok := pd.popTask(i)
+		if !ok {
+			// shutdown triggered, abort merge
+			return
+		}
 		tempFile, eo := os.Open(task.tempFilename)
 		if eo != nil {
 			pd.errCh <- eo
@@ -303,12 +342,10 @@ func (pd *ChunkDownload) mergeFile() {
 			pd.errCh <- eo
 			return
 		}
-		// 合并完成则进行移除
 		_ = os.Remove(task.tempFilename)
-		if i < pd.lastIndex {
-			continue
+		if i >= pd.lastIndex {
+			break
 		}
-		break
 	}
 
 	err = os.RemoveAll(pd.tempDir)
@@ -317,17 +354,13 @@ func (pd *ChunkDownload) mergeFile() {
 	}
 }
 
-func (pd *ChunkDownload) interruptSignalWaiter() {
-	select {
-	case <-ChunkExitChan:
-		shutdown = true
-	}
-}
-
 func (pd *ChunkDownload) Do(ctx ...context.Context) error {
-	if shutdown {
+	if isShutdown() {
 		return errors.New("service is shutdown")
 	}
+
+	ShutdownWg().Add(1)
+	defer ShutdownWg().Done()
 
 	err := pd.ensure()
 	if err != nil {
@@ -347,7 +380,9 @@ func (pd *ChunkDownload) Do(ctx ...context.Context) error {
 		pd.totalBytes = resp.ContentLength
 	}
 
+	runningMu.Lock()
 	runningMap[pd] = true
+	runningMu.Unlock()
 
 	pd.wg.Add(1)
 	go pd.mergeFile()
@@ -361,9 +396,14 @@ func (pd *ChunkDownload) Do(ctx ...context.Context) error {
 	select {
 	case <-pd.wgDoneCh:
 		close(pd.doneCh)
+		runningMu.Lock()
 		delete(runningMap, pd)
+		runningMu.Unlock()
 	case err := <-pd.errCh:
+		close(pd.doneCh)
+		runningMu.Lock()
 		delete(runningMap, pd)
+		runningMu.Unlock()
 		return err
 	}
 	return nil
@@ -384,9 +424,6 @@ func (pd *ChunkDownload) calTask() {
 	}
 	pd.lastIndex = len(ranges) - 1
 	for i, r := range ranges {
-		if shutdown {
-			break
-		}
 		task := &downloadTask{
 			tempFilename: r.fileName,
 			index:        i,
@@ -395,7 +432,13 @@ func (pd *ChunkDownload) calTask() {
 			completed:    r.completed,
 			totalSize:    r.end - r.start + 1,
 		}
-		pd.taskCh <- task
+		select {
+		case pd.taskCh <- task:
+		case <-pd.doneCh:
+			return
+		case <-GlobalContext().Done():
+			return
+		}
 	}
 }
 
@@ -517,6 +560,7 @@ type progressWriter struct {
 	fileName       string
 	startTime      time.Time
 	m              sync.Mutex
+	progressFunc   ProgressFunc
 }
 
 func (p *progressWriter) updateDownloading(downloaded int64) {
@@ -536,17 +580,38 @@ func (p *progressWriter) updateDownloaded(downloaded int64) {
 
 func (p *progressWriter) log() {
 	LogProgress("downloading", p.fileName, p.startTime, p.thisDownloaded, p.downloaded, p.totalSize, true)
+	if p.progressFunc != nil {
+		elapsed := time.Since(p.startTime).Seconds()
+		var speed float64
+		if elapsed > 0 {
+			speed = float64(p.thisDownloaded) / 1024 / elapsed
+		}
+		percent := float64(p.downloaded) / float64(p.totalSize) * 100
+		done := p.downloaded >= p.totalSize
+		p.progressFunc(p.fileName, p.downloaded, p.totalSize, percent, speed, done)
+	}
 }
 
 type chunkProgressWriter struct {
-	downloaded int64
-	totalSize  int64
-	startTime  time.Time
-	fileName   string
+	downloaded   int64
+	totalSize    int64
+	startTime    time.Time
+	fileName     string
+	progressFunc ProgressFunc
 }
 
 func (c *chunkProgressWriter) log() {
 	LogProgress("downloading", c.fileName, c.startTime, c.downloaded, c.downloaded, c.totalSize, false)
+	if c.progressFunc != nil {
+		elapsed := time.Since(c.startTime).Seconds()
+		var speed float64
+		if elapsed > 0 {
+			speed = float64(c.downloaded) / 1024 / elapsed
+		}
+		percent := float64(c.downloaded) / float64(c.totalSize) * 100
+		done := c.downloaded >= c.totalSize
+		c.progressFunc(c.fileName, c.downloaded, c.totalSize, percent, speed, done)
+	}
 }
 
 func (c *chunkProgressWriter) downloadCallback(info req.DownloadInfo) {

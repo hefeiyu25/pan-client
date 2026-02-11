@@ -1,6 +1,7 @@
 package cloudreve
 
 import (
+	"github.com/hefeiyu25/pan-client/pan"
 	"time"
 )
 
@@ -303,16 +304,18 @@ type ShareListReq struct {
 }
 
 type OneDriveUploadReq struct {
-	UploadUrl    string
-	LocalFile    string
-	UploadedSize int64
-	ChunkSize    int64
+	UploadUrl        string
+	LocalFile        string
+	UploadedSize     int64
+	ChunkSize        int64
+	ProgressCallback pan.ProgressCallback
 }
 
 type NotKnowUploadReq struct {
-	UploadUrl    string
-	Credential   string
-	LocalFile    string
-	UploadedSize int64
-	ChunkSize    int64
+	UploadUrl        string
+	Credential       string
+	LocalFile        string
+	UploadedSize     int64
+	ChunkSize        int64
+	ProgressCallback pan.ProgressCallback
 }

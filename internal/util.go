@@ -4,7 +4,7 @@ import (
 	"crypto/md5"
 	"crypto/sha1"
 	"encoding/hex"
-	logger "github.com/sirupsen/logrus"
+	"fmt"
 	"io"
 	"math/rand"
 	"mime"
@@ -148,20 +148,18 @@ func LogProgress(prefix, fileName string, startTime time.Time, thisOperated, ope
 
 	// 计算进度百分比
 	percent := float64(operated) / float64(totalSize) * 100
-	if Config.Server.Debug {
-		logger.Debugf("%s %s: %.2f%% (%d/%d bytes, %.2f KB/s)", prefix, fileName, percent, operated, totalSize, speed)
-	}
+	msg := fmt.Sprintf("%s %s: %.2f%% (%d/%d bytes, %.2f KB/s)", prefix, fileName, percent, operated, totalSize, speed)
+	GetLogger().Debug(msg)
 	if mustLog {
-		logger.Infof("%s %s: %.2f%% (%d/%d bytes, %.2f KB/s)", prefix, fileName, percent, operated, totalSize, speed)
+		GetLogger().Info(msg)
 	}
 	if operated == totalSize {
-		// 完成时就重新拿已操作数据来算速度了
 		if elapsed == 0 {
 			speed = float64(operated) / 1024
 		} else {
-			speed = float64(operated) / 1024 / elapsed // KB/s
+			speed = float64(operated) / 1024 / elapsed
 		}
-		logger.Infof("%s %s: %.2f%% (%d/%d bytes, %.2f KB/s), cost %.2f s", prefix, fileName, percent, operated, totalSize, speed, elapsed)
+		GetLogger().Info(fmt.Sprintf("%s %s: %.2f%% (%d/%d bytes, %.2f KB/s), cost %.2f s", prefix, fileName, percent, operated, totalSize, speed, elapsed))
 	}
 }
 
@@ -169,8 +167,6 @@ func LogProgress(prefix, fileName string, startTime time.Time, thisOperated, ope
 func GenRandomWord() string {
 	const letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 	b := make([]byte, 4)
-	rand.Seed(time.Now().UnixNano())
-
 	for i := range b {
 		b[i] = letters[rand.Intn(len(letters))]
 	}

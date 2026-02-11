@@ -1,249 +1,221 @@
 # Pan Client
 
-一个统一的 Go 语言云盘客户端库，支持多种云存储服务，提供一致的 API 接口。
+Go 语言多云盘统一客户端 SDK，支持夸克网盘、迅雷云盘、Cloudreve，提供一致的文件操作接口。
 
-[![Go Version](https://img.shields.io/badge/Go-1.23+-blue.svg)](https://golang.org)
-[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+纯 SDK 设计，无全局配置文件，无内置文件日志，所有状态管理交由调用方处理。
 
-## ✨ 特性
-
-- **多云盘支持** - 统一接口操作多种云存储服务
-- **断点续传** - 支持上传和下载的断点续传
-- **多线程传输** - 并发上传下载提升性能
-- **目录递归** - 支持目录的递归上传和下载
-- **文件过滤** - 按扩展名、文件名进行过滤
-- **进度回调** - 实时获取传输进度
-- **配置持久化** - 自动保存配置和缓存
-- **错误重试** - 内置错误处理和重试机制
-
-## 🚀 支持的服务
-
-| 云盘服务 | 驱动类型 | 状态 |
-|---------|---------|------|
-| Cloudreve | `cloudreve` | ✅ 完整支持 |
-| 夸克云盘 | `quark` | ✅ 完整支持 |
-| 迅雷浏览器 | `thunder_browser` | ✅ 完整支持 |
-
-## 📦 安装
+## 安装
 
 ```bash
-go get github.com/hefeiyu2025/pan-client
+go get github.com/hefeiyu25/pan-client
 ```
 
-## 🔧 快速开始
+要求 Go 1.23+
 
-### 1. 基本使用
+## 支持的云盘
+
+| 服务 | 驱动 | 认证方式 |
+|------|------|---------|
+| 夸克网盘 | `quark` | cookies.txt (Netscape 格式) |
+| 迅雷云盘 | `thunder_browser` | access_token / refresh_token / 用户名密码 |
+| Cloudreve | `cloudreve` | session cookie |
+
+## 快速开始
+
+### 初始化
 
 ```go
 package main
 
 import (
-    "fmt"
-    "github.com/hefeiyu2025/pan-client"
-    _ "github.com/hefeiyu2025/pan-client/pan/driver" // 导入所有驱动
+    "log/slog"
+    "os"
+
+    pan "github.com/hefeiyu25/pan-client"
+    "github.com/hefeiyu25/pan-client/pan/driver/quark"
 )
 
 func main() {
-    // 获取 Cloudreve 客户端
-    client, err := pan.GetClient(pan.Cloudreve)
+    defer pan.GracefulExit()
+
+    // 可选：设置自定义 logger
+    pan.Init(pan.WithLogger(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+        Level: slog.LevelDebug,
+    }))))
+
+    // 创建夸克客户端
+    client, err := pan.NewQuarkClient(quark.QuarkProperties{
+        CookieFile: "pan.quark.cn_cookies.txt",
+    },
+        pan.WithDownloadMaxThread(20),
+        pan.WithDownloadTmpPath("./tmp"),
+    )
     if err != nil {
         panic(err)
     }
-    
-    // 获取磁盘信息
-    disk, err := client.Disk()
-    if err != nil {
-        panic(err)
+
+    // 列出根目录
+    list, _ := client.List(pan.ListReq{
+        Dir: &pan.PanObj{Path: "/", Type: "dir"},
+    })
+    for _, item := range list {
+        slog.Info("file", "name", item.Name, "type", item.Type)
     }
-    fmt.Printf("总空间: %d MB, 已用: %d MB, 剩余: %d MB\n", 
-        disk.Total, disk.Used, disk.Free)
 }
 ```
 
-### 2. 上传文件/目录
+注意：上面 `pan.ListReq` 和 `pan.PanObj` 的完整路径是 `github.com/hefeiyu25/pan-client/pan`，为简洁起见示例中使用短名。
+
+### 创建其他客户端
 
 ```go
-// 上传单个文件
+// 迅雷云盘
+client, err := pan.NewThunderClient(thunder_browser.ThunderBrowserProperties{
+    Username: "user",
+    Password: "pass",
+},
+    pan.WithOnChange(func(props pan.Properties) {
+        // token 刷新后回调，调用方自行持久化
+        data, _ := json.Marshal(props)
+        os.WriteFile("thunder.json", data, 0644)
+    }),
+)
+
+// Cloudreve
+client, err := pan.NewCloudreveClient(cloudreve.CloudreveProperties{
+    Url:     "https://pan.example.com",
+    Session: "your_session",
+})
+```
+
+## ClientOption
+
+每个客户端创建时可传入以下选项：
+
+| Option | 说明 | 默认值 |
+|--------|------|--------|
+| `WithOnChange(fn)` | 属性变更回调（token 刷新等），调用方负责持久化 | nil |
+| `WithContext(ctx)` | 客户端生命周期 context | `context.Background()` |
+| `WithDownloadTmpPath(path)` | 分块下载临时目录 | `./download_tmp` |
+| `WithDownloadMaxThread(n)` | 最大下载并发数 | 50 |
+| `WithDownloadMaxRetry(n)` | 分块下载最大重试次数 | 3 |
+
+## GlobalOption
+
+`Init()` 接受全局选项：
+
+| Option | 说明 | 默认值 |
+|--------|------|--------|
+| `WithLogger(l)` | 设置 `*slog.Logger`，库内所有日志走此 logger | `slog.Default()` |
+
+## 文件操作
+
+### 列出目录
+
+```go
+list, err := client.List(pan.ListReq{
+    Dir:    &pan.PanObj{Path: "/", Name: "documents"},
+    Reload: true, // 强制刷新缓存
+})
+```
+
+### 上传
+
+```go
+// 上传单文件
 err = client.UploadFile(pan.UploadFileReq{
-    LocalFile:  "./local/file.pdf",
-    RemotePath: "/remote/folder",
-    Resumable:  true, // 启用断点续传
+    LocalFile:  "./data/report.pdf",
+    RemotePath: "/backup",
+    Resumable:  true,
 })
 
-// 上传整个目录
+// 上传目录
 err = client.UploadPath(pan.UploadPathReq{
-    LocalPath:   "./local/data",
+    LocalPath:   "./data",
     RemotePath:  "/backup",
     Resumable:   true,
     Extensions:  []string{".pdf", ".doc"}, // 只上传指定类型
-    IgnorePaths: []string{"temp"},         // 忽略目录
-    SuccessDel:  false,                    // 上传成功后删除本地文件
+    IgnorePaths: []string{"temp"},
+    SuccessDel:  false,
 })
 ```
 
-### 3. 下载文件/目录
+### 下载
 
 ```go
-// 下载单个文件
+// 下载单文件
 err = client.DownloadFile(pan.DownloadFileReq{
-    RemoteFile:  fileObj,          // 从 List 获取的 PanObj
+    RemoteFile:  fileObj,
     LocalPath:   "./downloads",
-    Concurrency: 4,                // 4线程并发
-    ChunkSize:   50 * 1024 * 1024, // 50MB 分块
-    OverCover:   true,             // 覆盖已存在文件
+    Concurrency: 4,
+    ChunkSize:   50 * 1024 * 1024,
+    OverCover:   true,
 })
 
-// 下载整个目录
+// 下载目录
 err = client.DownloadPath(pan.DownloadPathReq{
-    RemotePath:  &pan.PanObj{Path: "/", Name: "backup"},
-    LocalPath:   "./local/backup",
+    RemotePath:  dirObj,
+    LocalPath:   "./downloads",
     Concurrency: 4,
-    Extensions:  []string{".pdf"},
-    NotTraverse: false, // 是否遍历子目录
+    Extensions:  []string{".mp4"},
+    SkipFileErr: true,
 })
 ```
 
-### 4. 文件操作
+### 其他操作
 
 ```go
-// 列出目录
-objs, err := client.List(pan.ListReq{
-    Dir: &pan.PanObj{Path: "/", Name: "documents"},
-    Reload: true, // 强制刷新缓存
-})
-
 // 创建目录
-newDir, err := client.Mkdir(pan.MkdirReq{
-    NewPath: "/backup/2024",
-})
+dir, err := client.Mkdir(pan.MkdirReq{NewPath: "/new_folder"})
 
 // 重命名
-err = client.ObjRename(pan.ObjRenameReq{
-    Obj:     fileObj,
-    NewName: "new_name.pdf",
-})
+err = client.ObjRename(pan.ObjRenameReq{Obj: fileObj, NewName: "new.pdf"})
 
 // 批量重命名
 err = client.BatchRename(pan.BatchRenameReq{
     Path: dirObj,
     Func: func(obj *pan.PanObj) string {
-        return fmt.Sprintf("prefix_%s", obj.Name)
+        return "prefix_" + obj.Name
     },
 })
 
-// 移动文件
-err = client.Move(pan.MovieReq{
-    Items:     []*pan.PanObj{file1, file2},
-    TargetObj: targetDir,
-})
+// 移动
+err = client.Move(pan.MovieReq{Items: []*pan.PanObj{f1, f2}, TargetObj: targetDir})
 
-// 删除文件
-err = client.Delete(pan.DeleteReq{
-    Items: []*pan.PanObj{file1, file2},
+// 删除
+err = client.Delete(pan.DeleteReq{Items: []*pan.PanObj{f1, f2}})
+
+// 磁盘信息
+disk, err := client.Disk()
+
+// 离线下载
+task, err := client.OfflineDownload(pan.OfflineDownloadReq{
+    Url:        "https://example.com/file.zip",
+    RemotePath: "/downloads",
 })
 ```
 
-### 5. 高级功能
-
-```go
-// 获取直链
-links, err := client.DirectLink(pan.DirectLinkReq{
-    List: []*pan.DirectLink{
-        {FileId: "123", Name: "file.pdf"},
-    },
-})
-
-// 设置自定义配置读写
-client, err = pan.GetClientByRw(
-    "custom-id",
-    pan.Cloudreve,
-    func(config pan.Properties) error {
-        // 自定义读取配置
-        return nil
-    },
-    func(config pan.Properties) error {
-        // 自定义写入配置
-        return nil
-    },
-)
-```
-
-## ⚙️ 配置文件
-
-配置文件 `pan-client.yaml` 示例：
-
-```yaml
-driver:
-  cloudreve:
-    url: https://pan.example.com
-    session: your_session_cookie
-    type: hucl
-    chunk_size: 104857600  # 100MB
-    skip_verify: false
-    refresh_time: 0
-    
-  quark:
-    id: your_quark_id
-    pus: your_pus_token
-    puus: your_puus_token
-    chunk_size: 104857600
-    
-  thunder_browser:
-    access_token: your_token
-    refresh_token: your_refresh_token
-    username: your_username
-    password: your_password
-    device_id: your_device_id
-
-log:
-  enable: true
-  file_name: app.log
-  max_size: 50      # MB
-  max_backups: 30
-  max_age: 28       # days
-  compress: false
-
-server:
-  cache_file: cache.dat
-  debug: true
-  download_max_retry: 2
-  download_max_thread: 5
-  download_tmp_path: ./tmp
-```
-
-## 🔍 核心接口
-
-### Driver 接口
-
-所有云盘驱动都实现以下接口：
+## 核心接口
 
 ```go
 type Driver interface {
-    Meta      // 元数据操作
-    Operate   // 文件操作
-    Share     // 分享功能
+    Meta
+    Operate
+    Share
 }
-```
 
-### Meta 接口
-
-```go
 type Meta interface {
     GetId() string
     Init() (string, error)
-    InitByCustom(id string, read, write ConfigRW) (string, error)
-    Drop() error
-    ReadConfig() error
-    WriteConfig() error
+    Close() error
+    GetProperties() Properties
     Get(key string) (interface{}, bool)
+    GetOrLoad(key string, loader func() (interface{}, error)) (interface{}, error)
     Set(key string, value interface{})
+    SetWithTTL(key string, value interface{}, d time.Duration)
     Del(key string)
 }
-```
 
-### Operate 接口
-
-```go
 type Operate interface {
     Disk() (*DiskResp, error)
     List(req ListReq) ([]*PanObj, error)
@@ -260,137 +232,56 @@ type Operate interface {
     TaskList(req TaskListReq) ([]*Task, error)
     DirectLink(req DirectLinkReq) ([]*DirectLink, error)
 }
-```
 
-## 📊 数据结构
-
-### PanObj - 云盘对象
-
-```go
-type PanObj struct {
-    Id     string    // 对象ID
-    Name   string    // 名称
-    Path   string    // 路径
-    Size   int64     // 大小（字节）
-    Type   string    // 类型：file/dir
-    Ext    Json      // 扩展数据
-    Parent *PanObj   // 父对象
+type Share interface {
+    ShareList(req ShareListReq) ([]*ShareData, error)
+    NewShare(req NewShareReq) (*ShareData, error)
+    DeleteShare(req DelShareReq) error
+    ShareRestore(req ShareRestoreReq) error
 }
 ```
 
-### DiskResp - 磁盘信息
+## 设计原则
 
-```go
-type DiskResp struct {
-    Used  int64  // 已用空间（MB）
-    Free  int64  // 剩余空间（MB）
-    Total int64  // 总空间（MB）
-}
-```
+- **纯 SDK**：无配置文件，无文件日志，无全局状态，所有参数通过构造函数传入
+- **状态回调**：token 刷新等状态变更通过 `OnChange` 回调通知调用方，持久化由调用方负责
+- **标准日志**：使用 `log/slog`，调用方通过 `WithLogger` 注入自己的 Handler
+- **Per-Client 配置**：下载并发、重试等参数每个客户端独立配置
+- **Context 支持**：支持通过 `WithContext` 控制客户端生命周期
 
-## 🛠️ 开发指南
+## 开发
 
 ### 添加新驱动
 
 1. 在 `pan/driver/` 下创建新包
 2. 实现 `Driver` 接口
-3. 在 `init()` 中注册驱动：
+3. 在 `init()` 中注册：
 
 ```go
 func init() {
-    pan.RegisterDriver(pan.NewDriverType, func() pan.Driver {
-        return &NewDriver{
-            PropertiesOperate: pan.PropertiesOperate[*NewDriverProperties]{
-                DriverType: pan.NewDriverType,
+    pan.RegisterDriver(pan.YourType, func() pan.Driver {
+        return &YourDriver{
+            PropertiesOperate: pan.PropertiesOperate[*YourProperties]{
+                DriverType: pan.YourType,
             },
-            CacheOperate:  pan.CacheOperate{DriverType: pan.NewDriverType},
+            CacheOperate:  pan.NewCacheOperate(),
             CommonOperate: pan.CommonOperate{},
         }
     })
 }
 ```
 
+4. 在 `pan/driver/all.go` 中添加 import
+5. 在 `enter.go` 中添加 `NewYourClient` 工厂函数
+
 ### 测试
 
 ```bash
-# 运行测试
-go test -v
-
-# 运行特定测试
-go test -v -run TestDownloadAndUpload
+go test -v -run TestListDir      # 夸克目录列表
+go test -v -run TestDirectLink   # 直链获取
+go test -v -run TestDownloadAndUpload  # 上传下载
 ```
 
-## 📝 使用示例
+## License
 
-完整示例请参考 `enter_test.go` 文件。
-
-```go
-func TestDownloadAndUpload(t *testing.T) {
-    defer GracefulExist()
-    
-    client, err := GetClient(pan.Cloudreve)
-    if err != nil {
-        t.Error(err)
-        return
-    }
-    
-    // 上传
-    err = client.UploadPath(pan.UploadPathReq{
-        LocalPath:  "./tmpdata",
-        RemotePath: "/test1",
-        Resumable:  true,
-        Extensions: []string{".pdf"},
-    })
-    
-    // 列出并下载
-    list, err := client.List(pan.ListReq{
-        Dir:    &pan.PanObj{Path: "/", Name: "test1"},
-        Reload: true,
-    })
-    
-    for _, item := range list {
-        if item.Type == "file" {
-            err = client.DownloadFile(pan.DownloadFileReq{
-                RemoteFile: item,
-                LocalPath:  "./tmpdata",
-                Concurrency: 2,
-            })
-        }
-    }
-}
-```
-
-## 🔒 安全说明
-
-- 所有敏感信息（token、session）都应存储在配置文件中
-- 建议将配置文件添加到 `.gitignore`
-- 使用环境变量或密钥管理服务存储生产环境凭证
-
-## 🤝 贡献指南
-
-1. Fork 本仓库
-2. 创建特性分支 (`git checkout -b feature/AmazingFeature`)
-3. 提交更改 (`git commit -m 'Add some AmazingFeature'`)
-4. 推送到分支 (`git push origin feature/AmazingFeature`)
-5. 开启 Pull Request
-
-## 📄 许可证
-
-本项目采用 MIT 许可证 - 查看 [LICENSE](LICENSE) 文件了解详情
-
-## 🐛 问题反馈
-
-- 提交 Issue
-- 提供详细的错误信息和复现步骤
-- 附上相关日志和配置
-
-## 🙏 致谢
-
-- [Go](https://golang.org/) - 优秀的编程语言
-- [logrus](https://github.com/sirupsen/logrus) - 日志库
-- [viper](https://github.com/spf13/viper) - 配置管理
-- [req](https://github.com/imroc/req) - HTTP 客户端
-
----
-
-**Pan Client** © 2025 - Made with ❤️ by hefeiyu2025
+MIT

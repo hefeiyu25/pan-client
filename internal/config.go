@@ -1,77 +1,10 @@
 package internal
 
 import (
-	"errors"
 	"fmt"
-	"github.com/spf13/viper"
 	"reflect"
 	"strconv"
 )
-
-type ServerConfig struct {
-	Debug             bool   `mapstructure:"debug" json:"debug" yaml:"debug" default:"false"`
-	CacheFile         string `mapstructure:"cache_file" json:"cache_file"  yaml:"cache_file" default:"cache.dat"`
-	DownloadTmpPath   string `mapstructure:"download_tmp_path" json:"download_tmp_path"  yaml:"download_tmp_path"  default:"./download_tmp"`
-	DownloadMaxThread int    `mapstructure:"download_max_thread" json:"download_max_thread"  yaml:"download_max_thread"  default:"50"`
-	DownloadMaxRetry  int    `mapstructure:"download_max_retry" json:"download_max_retry"  yaml:"download_max_retry"  default:"3"`
-}
-
-type LogConfig struct {
-	Enable     bool   `mapstructure:"enable" json:"enable" yaml:"enable" default:"true"`
-	FileName   string `mapstructure:"file_name" json:"file_name" yaml:"file_name" default:"app.log"`
-	MaxSize    int    `mapstructure:"max_size" json:"max_size"  yaml:"max_size" default:"50"`
-	MaxBackups int    `mapstructure:"max_backups" json:"max_backups" yaml:"max_backups" default:"30"`
-	MaxAge     int    `mapstructure:"max_age" json:"max_age"  yaml:"max_age" default:"28"`
-	Compress   bool   `mapstructure:"compress" json:"compress" yaml:"compress" default:"false"`
-}
-
-type RootConfig struct {
-	Server *ServerConfig `mapstructure:"server" json:"server" yaml:"server"`
-	Log    *LogConfig    `mapstructure:"log" json:"log" yaml:"log"`
-}
-
-var Config RootConfig
-var Viper *viper.Viper
-
-func InitConfig() {
-	configName := "pan-client"
-	// 添加运行目录
-	v := viper.New()
-	Viper = v
-	v.AddConfigPath(GetProcessPath())
-
-	// 添加当前目录
-	v.AddConfigPath(GetWorkPath())
-	v.SetConfigName(configName)
-	SetDefaultByTag(&Config)
-	if err := v.ReadInConfig(); err != nil { // 读取配置文件
-		// 使用类型断言检查是否为 *os.PathError 类型
-		var pathErr viper.ConfigFileNotFoundError
-		if errors.As(err, &pathErr) {
-			val := reflect.ValueOf(Config)
-			for i := 0; i < val.NumField(); i++ {
-				// 获取字段名
-				name := val.Type().Field(i).Tag.Get("mapstructure")
-				// 获取字段值
-				value := val.Field(i).Interface()
-				v.SetDefault(name, value)
-			}
-			err = v.WriteConfigAs(GetWorkPath() + "/" + configName + ".yaml")
-			if err != nil {
-				panic(err)
-			} else {
-				// 重新读取已经写入的文件
-				_ = v.ReadInConfig()
-			}
-		} else {
-			panic(err)
-		}
-	}
-
-	if err := v.Unmarshal(&Config); err != nil { // 解码配置文件到结构体
-		panic(err)
-	}
-}
 
 // SetDefaultByTag 根据结构体字段的tag设置默认值，包括嵌套对象和指针
 func SetDefaultByTag(obj interface{}) {

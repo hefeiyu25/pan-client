@@ -53,6 +53,19 @@ type PanObj struct {
 }
 type RemoteTransfer func(remote string) string
 
+// ProgressEvent 传输进度事件
+type ProgressEvent struct {
+	FileName  string  // 当前文件名
+	Operated  int64   // 已传输字节
+	TotalSize int64   // 总字节
+	Percent   float64 // 百分比 0-100
+	Speed     float64 // KB/s
+	Done      bool    // 是否完成
+}
+
+// ProgressCallback 传输进度回调
+type ProgressCallback func(event ProgressEvent)
+
 type UploadFileReq struct {
 	LocalFile          string `json:"localFile,omitempty"`
 	RemotePath         string `json:"remotePath,omitempty"`
@@ -61,6 +74,7 @@ type UploadFileReq struct {
 	SuccessDel         bool   `json:"successDel,omitempty"`
 	RemotePathTransfer RemoteTransfer
 	RemoteNameTransfer RemoteTransfer
+	ProgressCallback   ProgressCallback
 }
 
 type UploadPathReq struct {
@@ -76,7 +90,9 @@ type UploadPathReq struct {
 	IgnoreExtensions   []string `json:"ignoreExtensions,omitempty"`
 	RemotePathTransfer RemoteTransfer
 	RemoteNameTransfer RemoteTransfer
+	ProgressCallback   ProgressCallback
 }
+
 type DownloadCallback func(localPath, localFile string)
 
 type DownloadPathReq struct {
@@ -94,6 +110,7 @@ type DownloadPathReq struct {
 	IgnoreExtensions   []string `json:"ignoreExtensions,omitempty"`
 	RemoteNameTransfer RemoteTransfer
 	DownloadCallback
+	ProgressCallback ProgressCallback
 }
 
 type DownloadFileReq struct {
@@ -103,6 +120,7 @@ type DownloadFileReq struct {
 	ChunkSize        int64   `json:"chunkSize,omitempty"`
 	OverCover        bool    `json:"overCover,omitempty"`
 	DownloadCallback `json:"downloadCallback,omitempty"`
+	ProgressCallback ProgressCallback
 }
 
 type OfflineDownloadReq struct {

@@ -5,8 +5,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"github.com/hefeiyu2025/pan-client/internal"
-	"github.com/hefeiyu2025/pan-client/pan"
+	"github.com/hefeiyu25/pan-client/internal"
+	"github.com/hefeiyu25/pan-client/pan"
 	"github.com/imroc/req/v3"
 	"net/http"
 	"strconv"
@@ -107,18 +107,7 @@ func (q *Quark) config() (*RespData[Config], pan.DriverErrorInterface) {
 	if successResult.Code != 0 {
 		return nil, pan.CodeMsg(successResult.Code, successResult.Msg)
 	}
-	for _, cookie := range response.Cookies() {
-		if cookie.Name == CookiePuusKey {
-			q.Properties.Puus = cookie.Value
-			q.Properties.RefreshTime = time.Now().UnixMilli()
-			q.sessionClient.SetCommonCookies(&http.Cookie{Name: CookiePuusKey, Value: q.Properties.Puus})
-		}
-		if cookie.Name == CookiePusKey {
-			q.Properties.Pus = cookie.Value
-			q.Properties.RefreshTime = time.Now().UnixMilli()
-			q.sessionClient.SetCommonCookies(&http.Cookie{Name: CookiePusKey, Value: q.Properties.Pus})
-		}
-	}
+	// cookies 由 CookieJar 自动管理和回写，无需手动处理
 	return &successResult, pan.NoError()
 }
 

@@ -2,8 +2,8 @@ package thunder_browser
 
 import (
 	"fmt"
-	"github.com/hefeiyu2025/pan-client/internal"
-	"github.com/hefeiyu2025/pan-client/pan"
+	"github.com/hefeiyu25/pan-client/internal"
+	"github.com/hefeiyu25/pan-client/pan"
 	"github.com/imroc/req/v3"
 	"net/http"
 	"regexp"
@@ -74,7 +74,7 @@ func (tb *ThunderBrowser) refreshCaptchaToken(action string, metas map[string]st
 	}
 
 	tb.Properties.CaptchaToken = result.CaptchaToken
-	_ = tb.WriteConfig()
+	tb.NotifyChange()
 	return nil
 }
 
@@ -125,6 +125,7 @@ func (tb *ThunderBrowser) setTokenResp(tokenResp *TokenResp) {
 	tb.Properties.ExpiresIn = tokenResp.ExpiresIn
 	tb.Properties.Sub = tokenResp.Sub
 	tb.Properties.UserID = tokenResp.UserID
+	tb.NotifyChange()
 }
 
 func (tb *ThunderBrowser) login(username, password string) (*TokenResp, pan.DriverErrorInterface) {

@@ -1,16 +1,16 @@
 package thunder_browser
 
 import (
+	"context"
 	"fmt"
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/s3/s3manager"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/google/uuid"
-	"github.com/hefeiyu2025/pan-client/internal"
-	"github.com/hefeiyu2025/pan-client/pan"
+	"github.com/hefeiyu25/pan-client/internal"
+	"github.com/hefeiyu25/pan-client/pan"
 	"github.com/imroc/req/v3"
-	logger "github.com/sirupsen/logrus"
 	"io"
 	"net/url"
 	"os"
@@ -62,16 +62,11 @@ func (cp *ThunderBrowserProperties) GetId() string {
 }
 
 func (cp *ThunderBrowserProperties) GetDriverType() pan.DriverType {
-	return pan.Cloudreve
+	return pan.ThunderBrowser
 }
 func (tb *ThunderBrowser) Init() (string, error) {
-	err := tb.ReadConfig()
-	if err != nil {
-		return "", err
-	}
 	driverId := tb.GetId()
 	if (tb.Properties.Username == "" || tb.Properties.Password == "") && tb.Properties.RefreshToken == "" {
-		_ = tb.WriteConfig()
 		return driverId, fmt.Errorf("please set login info ")
 	}
 	tb.Properties.DeviceID = internal.Md5HashStr(tb.Properties.Username + tb.Properties.Password)
@@ -84,9 +79,9 @@ func (tb *ThunderBrowser) Init() (string, error) {
 	}
 	tb.sessionClient = req.C().SetCommonHeaders(commonHeaderMap)
 
-	_, err = tb.userMe()
+	_, userErr := tb.userMe()
 	// 若能拿到用户信息，证明已经登录
-	if err != nil {
+	if userErr != nil {
 
 		// refreshToken不为空，则先用token登录
 		if tb.Properties.RefreshToken != "" {
@@ -108,22 +103,14 @@ func (tb *ThunderBrowser) Init() (string, error) {
 
 	tb.downloadClient = req.C().SetCommonHeader(HeaderUserAgent, DownloadUserAgent)
 
-	err = tb.WriteConfig()
-	if err != nil {
-		return driverId, err
-	}
+	tb.NotifyChange()
 	return driverId, nil
 }
 
-func (tb *ThunderBrowser) InitByCustom(id string, read pan.ConfigRW, write pan.ConfigRW) (string, error) {
-	tb.Properties = &ThunderBrowserProperties{Id: id}
-	tb.PropertiesOperate.Write = write
-	tb.PropertiesOperate.Read = read
-	return tb.Init()
-}
-
-func (tb *ThunderBrowser) Drop() error {
-	return pan.OnlyMsg("drop not support")
+func (tb *ThunderBrowser) Close() error {
+	tb.Cancel()
+	tb.StopCache()
+	return nil
 }
 
 func (tb *ThunderBrowser) Disk() (*pan.DiskResp, error) {
@@ -158,10 +145,10 @@ func (tb *ThunderBrowser) List(req pan.ListReq) ([]*pan.PanObj, error) {
 	if req.Reload {
 		tb.Del(cacheKey)
 	}
-	panObjs, exist, err := tb.GetOrDefault(cacheKey, func() (interface{}, error) {
+	result, err := tb.GetOrLoad(cacheKey, func() (interface{}, error) {
 		files, e := tb.getFiles(queryDir.Id)
 		if e != nil {
-			logger.Error(e)
+			internal.GetLogger().Error("get files error", "error", e)
 			return nil, e
 		}
 		panObjs := make([]*pan.PanObj, 0)
@@ -189,11 +176,8 @@ func (tb *ThunderBrowser) List(req pan.ListReq) ([]*pan.PanObj, error) {
 	if err != nil {
 		return make([]*pan.PanObj, 0), err
 	}
-	if exist {
-		objs, ok := panObjs.([]*pan.PanObj)
-		if ok {
-			return objs, nil
-		}
+	if objs, ok := result.([]*pan.PanObj); ok {
+		return objs, nil
 	}
 	return make([]*pan.PanObj, 0), nil
 }
@@ -218,36 +202,7 @@ func (tb *ThunderBrowser) ObjRename(req pan.ObjRenameReq) error {
 	return nil
 }
 func (tb *ThunderBrowser) BatchRename(req pan.BatchRenameReq) error {
-	objs, err := tb.List(pan.ListReq{
-		Reload: true,
-		Dir:    req.Path,
-	})
-	if err != nil {
-		return err
-	}
-	for _, object := range objs {
-		if object.Type == "dir" {
-			err = tb.BatchRename(pan.BatchRenameReq{
-				Path: object,
-				Func: req.Func,
-			})
-			if err != nil {
-				return err
-			}
-		}
-		newName := req.Func(object)
-
-		if newName != object.Name {
-			err = tb.ObjRename(pan.ObjRenameReq{
-				Obj:     object,
-				NewName: newName,
-			})
-			if err != nil {
-				return err
-			}
-		}
-	}
-	return nil
+	return tb.BaseBatchRename(req, tb.List, tb.ObjRename, tb.BatchRename)
 }
 func (tb *ThunderBrowser) Mkdir(req pan.MkdirReq) (*pan.PanObj, error) {
 	if req.NewPath == "" {
@@ -312,29 +267,12 @@ func (tb *ThunderBrowser) Move(req pan.MovieReq) error {
 		}
 		targetObj = create
 	}
-	reloadDirId := make(map[string]any)
-	objIds := make([]string, 0)
-	for _, item := range req.Items {
-		if item.Id != "0" && item.Id != "" {
-			objIds = append(objIds, item.Id)
-			if item.Type == "dir" {
-				reloadDirId[item.Id] = true
-			}
-		} else if item.Path != "" && item.Path != "/" {
-			obj, err := tb.GetPanObj(item.Path, true, tb.List)
-			if err == nil {
-				objIds = append(objIds, obj.Id)
-				if obj.Type == "dir" {
-					reloadDirId[obj.Id] = true
-				}
-			}
-		}
-	}
-	err := tb.move(objIds, targetObj.Id)
+	collected := pan.CollectItemIds(req.Items, tb.GetPanObj, tb.List, false)
+	err := tb.move(collected.ObjIds, targetObj.Id)
 	if err != nil {
 		return pan.OnlyError(err)
 	}
-	for key, _ := range reloadDirId {
+	for key := range collected.ReloadDirIds {
 		tb.Del(cacheDirectoryPrefix + key)
 	}
 	return nil
@@ -343,40 +281,16 @@ func (tb *ThunderBrowser) Delete(req pan.DeleteReq) error {
 	if len(req.Items) == 0 {
 		return nil
 	}
-	reloadDirId := make(map[string]any)
-	objIds := make([]string, 0)
-	for _, item := range req.Items {
-		if item.Id != "0" && item.Id != "" {
-			objIds = append(objIds, item.Id)
-			if item.Type == "dir" {
-				reloadDirId[item.Id] = true
-			} else {
-				if item.Parent.Id != "" {
-					reloadDirId[item.Parent.Id] = true
-				}
-			}
-		} else if item.Path != "" && item.Path != "/" {
-			obj, err := tb.GetPanObj(item.Path, true, tb.List)
-			if err == nil {
-				objIds = append(objIds, obj.Id)
-				if obj.Type == "dir" {
-					reloadDirId[obj.Id] = true
-				} else {
-					reloadDirId[item.Parent.Id] = true
-				}
-			}
-		}
-	}
-	if len(objIds) > 0 {
-		err := tb.remove(objIds)
+	collected := pan.CollectItemIds(req.Items, tb.GetPanObj, tb.List, true)
+	if len(collected.ObjIds) > 0 {
+		err := tb.remove(collected.ObjIds)
 		if err != nil {
 			return err
 		}
-		for key, _ := range reloadDirId {
+		for key := range collected.ReloadDirIds {
 			tb.Del(cacheDirectoryPrefix + key)
 		}
 	}
-
 	return nil
 }
 
@@ -386,7 +300,7 @@ func (tb *ThunderBrowser) UploadPath(req pan.UploadPathReq) error {
 
 func (tb *ThunderBrowser) UploadFile(req pan.UploadFileReq) error {
 	if req.Resumable {
-		logger.Warn("thunder_browser is not support resumeable")
+		internal.GetLogger().Warn("thunder_browser is not support resumeable")
 	}
 	if req.OnlyFast {
 		return pan.OnlyMsg("thunder_browser is not support fast upload")
@@ -442,35 +356,32 @@ func (tb *ThunderBrowser) UploadFile(req pan.UploadFileReq) error {
 	param := resp.Resumable.Params
 	if resp.UploadType == UploadTypeResumable {
 		param.Endpoint = strings.TrimLeft(param.Endpoint, param.Bucket+".")
-		s, err := session.NewSession(&aws.Config{
-			Credentials: credentials.NewStaticCredentials(param.AccessKeyID, param.AccessKeySecret, param.SecurityToken),
-			Region:      aws.String("xunlei"),
-			Endpoint:    aws.String(param.Endpoint),
+		s3Client := s3.New(s3.Options{
+			Credentials:  credentials.NewStaticCredentialsProvider(param.AccessKeyID, param.AccessKeySecret, param.SecurityToken),
+			Region:       "xunlei",
+			BaseEndpoint: aws.String(param.Endpoint),
 		})
-		if err != nil {
-			return err
-		}
-		uploader := s3manager.NewUploader(s)
-		if stat.Size() > s3manager.MaxUploadParts*s3manager.DefaultUploadPartSize {
-			uploader.PartSize = stat.Size() / (s3manager.MaxUploadParts - 1)
+		uploader := manager.NewUploader(s3Client)
+		if stat.Size() > int64(manager.MaxUploadParts)*manager.DefaultUploadPartSize {
+			uploader.PartSize = stat.Size() / (int64(manager.MaxUploadParts) - 1)
 		}
 		file, err := os.Open(req.LocalFile)
 		if err != nil {
 			return err
 		}
-		_, err = uploader.Upload(&s3manager.UploadInput{
+		_, err = uploader.Upload(context.Background(), &s3.PutObjectInput{
 			Bucket:  aws.String(param.Bucket),
 			Key:     aws.String(param.Key),
 			Expires: aws.Time(param.Expiration),
-			Body:    io.TeeReader(file, pan.NewProgressWriter(req.LocalFile, stat.Size())),
+			Body:    io.TeeReader(file, pan.NewProgressWriter(req.LocalFile, stat.Size(), req.ProgressCallback)),
 		})
 		_ = file.Close()
 		if err == nil && req.SuccessDel {
 			err = os.Remove(req.LocalFile)
 			if err != nil {
-				logger.Errorf("delete fail %s,%v", req.LocalFile, err)
+				internal.GetLogger().Error("delete fail", "file", req.LocalFile, "error", err)
 			} else {
-				logger.Infof("delete success %s", req.LocalFile)
+				internal.GetLogger().Info("delete success", "file", req.LocalFile)
 			}
 		}
 		return err
@@ -490,7 +401,7 @@ func (tb *ThunderBrowser) DownloadFile(req pan.DownloadFileReq) error {
 		}
 		downloadLink := link.WebContentLink
 		if downloadLink == "" {
-			logger.Errorf("cant get link:%s,try media link", req.RemoteFile.Name)
+			internal.GetLogger().Error("cant get link, try media link", "name", req.RemoteFile.Name)
 			for _, media := range link.Medias {
 				if media.Link.URL != "" {
 					downloadLink = media.Link.URL
@@ -499,7 +410,7 @@ func (tb *ThunderBrowser) DownloadFile(req pan.DownloadFileReq) error {
 			}
 		}
 		if downloadLink == "" {
-			logger.Debugf("cant get link:%s,%v", req.RemoteFile.Name, link)
+			internal.GetLogger().Debug("cant get link", "name", req.RemoteFile.Name, "link", link)
 			return "", pan.OnlyMsg(fmt.Sprintf("cant get link:%s", req.RemoteFile.Name))
 		}
 		return downloadLink, nil
@@ -696,7 +607,7 @@ func init() {
 			PropertiesOperate: pan.PropertiesOperate[*ThunderBrowserProperties]{
 				DriverType: pan.ThunderBrowser,
 			},
-			CacheOperate:  pan.CacheOperate{DriverType: pan.ThunderBrowser},
+			CacheOperate:  pan.NewCacheOperate(),
 			CommonOperate: pan.CommonOperate{},
 		}
 	})

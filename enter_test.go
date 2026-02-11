@@ -1,394 +1,564 @@
 package pan_client
 
 import (
-	"encoding/json"
+	"context"
 	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 
-	"github.com/hefeiyu2025/pan-client/internal"
-	"github.com/hefeiyu2025/pan-client/pan"
-	"github.com/hefeiyu2025/pan-client/pan/driver/thunder_browser"
-	logger "github.com/sirupsen/logrus"
+	"github.com/hefeiyu25/pan-client/pan"
+	"github.com/hefeiyu25/pan-client/pan/driver/quark"
 )
 
-func TestDownloadAndUpload(t *testing.T) {
-	defer GracefulExist()
-	client, err := GetClient(pan.Cloudreve)
+// ==========================================================
+// 测试配置：切换 driver 或测试根目录只需修改此处
+// ==========================================================
+
+const testRoot = "/pan-client-test" // 所有测试在此目录下操作
+
+func getClient(t *testing.T, opts ...ClientOption) pan.Driver {
+	t.Helper()
+	Init()
+	client, err := NewQuarkClient(quark.QuarkProperties{
+		CookieFile: "pan.quark.cn_cookies.txt",
+	}, opts...)
 	if err != nil {
-		t.Error(err)
-		return
+		t.Fatalf("create client: %v", err)
 	}
-	err = client.UploadPath(pan.UploadPathReq{
-		LocalPath:   "./tmpdata",
-		RemotePath:  "/test1",
-		Resumable:   true,
-		SkipFileErr: false,
-		SuccessDel:  false,
-		Extensions:  []string{".pdf"},
+	ensureTestRoot(t, client)
+	return client
+}
+
+// ==========================================================
+// Helper
+// ==========================================================
+
+// testRootDir 返回测试根目录的 PanObj
+func testRootDir() *pan.PanObj {
+	return &pan.PanObj{Path: testRoot, Type: "dir"}
+}
+
+// ensureTestRoot 确保测试根目录存在
+func ensureTestRoot(t *testing.T, client pan.Driver) {
+	t.Helper()
+	_, _ = client.Mkdir(pan.MkdirReq{NewPath: testRoot})
+}
+
+// mkdirOrSkip 创建目录，如果因回收站冲突等无法创建则 skip
+func mkdirOrSkip(t *testing.T, client pan.Driver, path string) *pan.PanObj {
+	t.Helper()
+	dir, err := client.Mkdir(pan.MkdirReq{NewPath: path})
+	if err == nil {
+		return dir
+	}
+	name := filepath.Base(path)
+	list, listErr := client.List(pan.ListReq{
+		Dir:    testRootDir(),
+		Reload: true,
+	})
+	if listErr == nil {
+		for _, item := range list {
+			if item.Name == name {
+				return item
+			}
+		}
+	}
+	t.Skipf("mkdir %s: %v (可能回收站冲突，跳过)", path, err)
+	return nil
+}
+
+// ==========================================================
+// 集成测试
+// ==========================================================
+
+// TestDisk 查询磁盘空间
+func TestDisk(t *testing.T) {
+	client := getClient(t)
+
+	disk, err := client.Disk()
+	if err != nil {
+		t.Fatalf("disk: %v", err)
+	}
+	slog.Info("磁盘信息", "total", disk.Total, "used", disk.Used, "free", disk.Free)
+	if disk.Total <= 0 {
+		t.Fatal("expected total > 0")
+	}
+}
+
+// TestListRoot 列出根目录
+func TestListRoot(t *testing.T) {
+	client := getClient(t)
+
+	list, err := client.List(pan.ListReq{
+		Dir:    testRootDir(),
+		Reload: true,
 	})
 	if err != nil {
-		t.Error(err)
-		return
+		t.Fatalf("list root: %v", err)
 	}
+	slog.Info("测试目录列表", "path", testRoot, "count", len(list))
+	for i, item := range list {
+		slog.Info("文件项", "index", i+1, "name", item.Name, "type", item.Type)
+	}
+}
 
-	list, err := client.List(pan.ListReq{Dir: &pan.PanObj{
-		Path: "/",
-		Name: "test1",
-	}, Reload: true})
+// TestMkdirAndDelete 创建目录 -> 删除
+func TestMkdirAndDelete(t *testing.T) {
+	client := getClient(t)
+	dirName := fmt.Sprintf("pan-test-%d", time.Now().UnixMilli())
+	dir := mkdirOrSkip(t, client, testRoot+"/"+dirName)
+	slog.Info("创建目录", "id", dir.Id, "name", dir.Name)
+
+	err := client.Delete(pan.DeleteReq{Items: []*pan.PanObj{dir}})
 	if err != nil {
-		t.Error(err)
-		return
+		t.Fatalf("delete: %v", err)
 	}
+	slog.Info("删除目录成功")
+}
+
+// TestMkdirRenameDelete 创建 -> 重命名 -> 验证 -> 删除
+func TestMkdirRenameDelete(t *testing.T) {
+	client := getClient(t)
+	dirName := fmt.Sprintf("pan-rename-%d", time.Now().UnixMilli())
+	dir := mkdirOrSkip(t, client, testRoot+"/"+dirName)
+	defer func() {
+		_ = client.Delete(pan.DeleteReq{Items: []*pan.PanObj{dir}})
+	}()
+
+	newName := fmt.Sprintf("pan-renamed-%d", time.Now().UnixMilli())
+	err := client.ObjRename(pan.ObjRenameReq{Obj: dir, NewName: newName})
+	if err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+	slog.Info("重命名成功", "from", dirName, "to", newName)
+
+	time.Sleep(2 * time.Second) // 等待服务端刷新
+	list, err := client.List(pan.ListReq{
+		Dir:    testRootDir(),
+		Reload: true,
+	})
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	found := false
 	for _, item := range list {
-		if item.Type == "file" && item.Name == "后浪电影学院039《看不见的剪辑》.pdf" {
-			err = client.DownloadFile(pan.DownloadFileReq{
-				RemoteFile:  item,
-				LocalPath:   "./tmpdata",
-				ChunkSize:   50 * 1024 * 1024,
-				OverCover:   false,
-				Concurrency: 2,
-				DownloadCallback: func(localPath, localFile string) {
-					logger.Info(localPath, localFile)
-				},
-			})
-			if err != nil {
-				t.Error(err)
-				return
-			}
-			err = client.ObjRename(pan.ObjRenameReq{
-				Obj:     item,
-				NewName: "1.pdf",
-			})
-			if err != nil {
-				t.Error(err)
-				return
-			}
-			err = client.ObjRename(pan.ObjRenameReq{
-				Obj:     item,
-				NewName: "后浪电影学院039《看不见的剪辑》.pdf",
-			})
-			if err != nil {
-				t.Error(err)
-				return
-			}
-			err = client.Move(pan.MovieReq{
-				Items: []*pan.PanObj{item},
-				TargetObj: &pan.PanObj{
-					Name: "test2",
-					Path: "/",
-					Type: "dir",
-				},
-			})
-			if err != nil {
-				t.Error(err)
-				return
-			}
-
-			err = client.Delete(pan.DeleteReq{
-				Items: []*pan.PanObj{item},
-			})
-			if err != nil {
-				t.Error(err)
-				return
-			}
-			err = client.UploadPath(pan.UploadPathReq{
-				LocalPath:   "./tmpdata",
-				RemotePath:  "/test1",
-				Resumable:   true,
-				SkipFileErr: false,
-				SuccessDel:  false,
-				Extensions:  []string{".pdf"},
-			})
-			if err != nil {
-				t.Error(err)
-				return
-			}
+		if item.Name == newName {
+			found = true
+			dir = item
+			break
 		}
 	}
-}
-
-func TestDownload(t *testing.T) {
-	defer GracefulExist()
-	client, err := GetClient(pan.Quark)
-	if err != nil {
-		t.Error(err)
-		return
-	}
-
-	err = client.DownloadPath(pan.DownloadPathReq{
-		RemotePath: &pan.PanObj{
-			Name: "来自：分享",
-			Type: "dir",
-		},
-		LocalPath:   "./tmpdata",
-		NotTraverse: true,
-		Concurrency: 3,
-		ChunkSize:   104857600,
-		OverCover:   true,
-		Extensions:  []string{".exe", ".pdf"},
-	})
-	if err != nil {
-		panic(err)
-		return
+	if !found {
+		t.Fatalf("renamed dir %s not found", newName)
 	}
 }
 
-func TestUpload(t *testing.T) {
-	defer GracefulExist()
-	client, err := GetClient(pan.Cloudreve)
-	if err != nil {
-		t.Error(err)
-		return
-	}
+// TestMkdirMoveDelete 创建两个目录 -> 移动 -> 验证 -> 清理
+func TestMkdirMoveDelete(t *testing.T) {
+	client := getClient(t)
+	ts := time.Now().UnixMilli()
+	srcName := fmt.Sprintf("pan-mv-s-%d", ts)
+	dstName := fmt.Sprintf("pan-mv-d-%d", ts)
+	src := mkdirOrSkip(t, client, testRoot+"/"+srcName)
+	dst := mkdirOrSkip(t, client, testRoot+"/"+dstName)
+	defer func() {
+		_ = client.Delete(pan.DeleteReq{Items: []*pan.PanObj{dst}})
+	}()
 
-	err = client.UploadFile(pan.UploadFileReq{
-		LocalFile:  "D:/download/包青天/新包青天/HD高清修復版 _ 新包青天  01_160 _ 情節峰迴路轉扣人心弦 _ 金超群 _ 呂良偉 _ 范鴻軒 _ 曾守明 _粵語_亞視經典劇集_Asia TV Drama_亞視 1995.mp4",
-		RemotePath: "/test1",
-		Resumable:  true,
-		SuccessDel: false,
+	err := client.Move(pan.MovieReq{Items: []*pan.PanObj{src}, TargetObj: dst})
+	if err != nil {
+		_ = client.Delete(pan.DeleteReq{Items: []*pan.PanObj{src}})
+		t.Fatalf("move: %v", err)
+	}
+	slog.Info("移动成功")
+
+	time.Sleep(2 * time.Second) // 等待服务端刷新
+	list, err := client.List(pan.ListReq{
+		Dir:    dst,
+		Reload: true,
 	})
 	if err != nil {
-		panic(err)
-		return
+		t.Fatalf("list dst: %v", err)
 	}
-}
-
-func TestOfflineDownload(t *testing.T) {
-	defer GracefulExist()
-	client, err := GetClient(pan.ThunderBrowser)
-	if err != nil {
-		t.Error(err)
-		return
-	}
-	downloadTask, err := client.OfflineDownload(pan.OfflineDownloadReq{
-		RemotePath: "/tmpdownload",
-		Url:        "magnet:?xt=urn:btih:bd28bedb444fc8293ba86ea8989bfe9e8ff2bf6e&dn=TVBOXNOW+%E6%88%80%E6%84%9B%E8%87%AA%E7%94%B1%E5%BC%8F&tr=udp%3A%2F%2Ftracker.publicbt.com%3A80%2Fannounce&tr=udp%3A%2F%2Ftracker.openbittorrent.com%3A80%2Fannounce&tr=udp%3A%2F%2Fpublic.popcorn-tracker.org%3A6969%2Fannounce&tr=http%3A%2F%2F104.28.1.30%3A8080%2Fannounce&tr=http%3A%2F%2F104.28.16.69%2Fannounce&tr=http%3A%2F%2F107.150.14.110%3A6969%2Fannounce&tr=http%3A%2F%2F109.121.134.121%3A1337%2Fannounce&tr=http%3A%2F%2F114.55.113.60%3A6969%2Fannounce&tr=http%3A%2F%2F125.227.35.196%3A6969%2Fannounce&tr=http%3A%2F%2F128.199.70.66%3A5944%2Fannounce&tr=http%3A%2F%2F157.7.202.64%3A8080%2Fannounce&tr=http%3A%2F%2F158.69.146.212%3A7777%2Fannounce&tr=http%3A%2F%2F173.254.204.71%3A1096%2Fannounce&tr=http%3A%2F%2F178.175.143.27%2Fannounce&tr=http%3A%2F%2F178.33.73.26%3A2710%2Fannounce&tr=http%3A%2F%2F182.176.139.129%3A6969%2Fannounce&tr=http%3A%2F%2F185.5.97.139%3A8089%2Fannounce&tr=http%3A%2F%2F188.165.253.109%3A1337%2Fannounce&tr=http%3A%2F%2F194.106.216.222%2Fannounce&tr=http%3A%2F%2F195.123.209.37%3A1337%2Fannounce&tr=http%3A%2F%2F210.244.71.25%3A6969%2Fannounce&tr=http%3A%2F%2F210.244.71.26%3A6969%2Fannounce&tr=http%3A%2F%2F213.159.215.198%3A6970%2Fannounce&tr=http%3A%2F%2F213.163.67.56%3A1337%2Fannounce&tr=http%3A%2F%2F37.19.5.139%3A6969%2Fannounce&tr=http%3A%2F%2F37.19.5.155%3A6881%2Fannounce&tr=http%3A%2F%2F46.4.109.148%3A6969%2Fannounce&tr=http%3A%2F%2F5.79.249.77%3A6969%2Fannounce&tr=http%3A%2F%2F5.79.83.193%3A2710%2Fannounce&tr=http%3A%2F%2F51.254.244.161%3A6969%2Fannounce&tr=http%3A%2F%2F59.36.96.77%3A6969%2Fannounce&tr=http%3A%2F%2F74.82.52.209%3A6969%2Fannounce&tr=http%3A%2F%2F80.246.243.18%3A6969%2Fannounce&tr=http%3A%2F%2F81.200.2.231%2Fannounce&tr=http%3A%2F%2F85.17.19.180%2Fannounce&tr=http%3A%2F%2F87.248.186.252%3A8080%2Fannounce&tr=http%3A%2F%2F87.253.152.137%2Fannounce&tr=http%3A%2F%2F91.216.110.47%2Fannounce&tr=http%3A%2F%2F91.217.91.21%3A3218%2Fannounce&tr=http%3A%2F%2F91.218.230.81%3A6969%2Fannounce&tr=http%3A%2F%2F93.92.64.5%2Fannounce&tr=http%3A%2F%2Fatrack.pow7.com%2Fannounce&tr=http%3A%2F%2Fbt.henbt.com%3A2710%2Fannounce&tr=http%3A%2F%2Fbt.pusacg.org%3A8080%2Fannounce&tr=http%3A%2F%2Fbt2.careland.com.cn%3A6969%2Fannounce&tr=http%3A%2F%2Fexplodie.org%3A6969%2Fannounce&tr=http%3A%2F%2Fmgtracker.org%3A2710%2Fannounce&tr=http%3A%2F%2Fmgtracker.org%3A6969%2Fannounce&tr=http%3A%2F%2Fopen.acgtracker.com%3A1096%2Fannounce&tr=http%3A%2F%2Fopen.lolicon.eu%3A7777%2Fannounce&tr=http%3A%2F%2Fopen.touki.ru%2Fannounce.php&tr=http%3A%2F%2Fp4p.arenabg.ch%3A1337%2Fannounce&tr=http%3A%2F%2Fp4p.arenabg.com%3A1337%2Fannounce&tr=http%3A%2F%2Fpow7.com%2Fannounce&tr=http%3A%2F%2Fretracker.gorcomnet.ru%2Fannounce&tr=http%3A%2F%2Fretracker.krs-ix.ru%2Fannounce&tr=http%3A%2F%2Fsecure.pow7.com%2Fannounce&tr=http%3A%2F%2Ft1.pow7.com%2Fannounce&tr=http%3A%2F%2Ft2.pow7.com%2Fannounce&tr=http%3A%2F%2Fthetracker.org%2Fannounce&tr=http%3A%2F%2Ftorrent.gresille.org%2Fannounce&tr=http%3A%2F%2Ftorrentsmd.com%3A8080%2Fannounce&tr=http%3A%2F%2Ftracker.aletorrenty.pl%3A2710%2Fannounce&tr=http%3A%2F%2Ftracker.baravik.org%3A6970%2Fannounce&tr=http%3A%2F%2Ftracker.bittor.pw%3A1337%2Fannounce&tr=http%3A%2F%2Ftracker.bittorrent.am%2Fannounce&tr=http%3A%2F%2Ftracker.calculate.ru%3A6969%2Fannounce&tr=http%3A%2F%2Ftracker.dler.org%3A6969%2Fannounce&tr=http%3A%2F%2Ftracker.dutchtracking.com%2Fannounce&tr=http%3A%2F%2Ftracker.dutchtracking.nl%2Fannounce&tr=http%3A%2F%2Ftracker.edoardocolombo.eu%3A6969%2Fannounce&tr=http%3A%2F%2Ftracker.ex.ua%2Fannounce&tr=http%3A%2F%2Ftracker.filetracker.pl%3A8089%2Fannounce&tr=http%3A%2F%2Ftracker.flashtorrents.org%3A6969%2Fannounce&tr=http%3A%2F%2Ftracker.grepler.com%3A6969%2Fannounce&tr=http%3A%2F%2Ftracker.internetwarriors.net%3A1337%2Fannounce&tr=http%3A%2F%2Ftracker.kicks-ass.net%2Fannounce&tr=http%3A%2F%2Ftracker.kuroy.me%3A5944%2Fannounce&tr=http%3A%2F%2Ftracker.mg64.net%3A6881%2Fannounce&tr=http%3A%2F%2Ftracker.opentrackr.org%3A1337%2Fannounce&tr=http%3A%2F%2Ftracker.skyts.net%3A6969%2Fannounce&tr=http%3A%2F%2Ftracker.tfile.me%2Fannounce&tr=http%3A%2F%2Ftracker.tiny-vps.com%3A6969%2Fannounce&tr=http%3A%2F%2Ftracker.tvunderground.org.ru%3A3218%2Fannounce&tr=http%3A%2F%2Ftracker.yoshi210.com%3A6969%2Fannounce&tr=http%3A%2F%2Ftracker1.wasabii.com.tw%3A6969%2Fannounce&tr=http%3A%2F%2Ftracker2.itzmx.com%3A6961%2Fannounce&tr=http%3A%2F%2Ftracker2.wasabii.com.tw%3A6969%2Fannounce&tr=http%3A%2F%2Fwww.wareztorrent.com%2Fannounce&tr=https%3A%2F%2F104.28.17.69%2Fannounce&tr=https%3A%2F%2Fwww.wareztorrent.com%2Fannounce&tr=udp%3A%2F%2F107.150.14.110%3A6969%2Fannounce&tr=udp%3A%2F%2F109.121.134.121%3A1337%2Fannounce&tr=udp%3A%2F%2F114.55.113.60%3A6969%2Fannounce&tr=udp%3A%2F%2F128.199.70.66%3A5944%2Fannounce&tr=udp%3A%2F%2F151.80.120.114%3A2710%2Fannounce&tr=udp%3A%2F%2F168.235.67.63%3A6969%2Fannounce&tr=udp%3A%2F%2F178.33.73.26%3A2710%2Fannounce&tr=udp%3A%2F%2F182.176.139.129%3A6969%2Fannounce&tr=udp%3A%2F%2F185.5.97.139%3A8089%2Fannounce&tr=udp%3A%2F%2F185.86.149.205%3A1337%2Fannounce&tr=udp%3A%2F%2F188.165.253.109%3A1337%2Fannounce&tr=udp%3A%2F%2F191.101.229.236%3A1337%2Fannounce&tr=udp%3A%2F%2F194.106.216.222%3A80%2Fannounce&tr=udp%3A%2F%2F195.123.209.37%3A1337%2Fannounce&tr=udp%3A%2F%2F195.123.209.40%3A80%2Fannounce&tr=udp%3A%2F%2F208.67.16.113%3A8000%2Fannounce&tr=udp%3A%2F%2F213.163.67.56%3A1337%2Fannounce&tr=udp%3A%2F%2F37.19.5.155%3A2710%2Fannounce&tr=udp%3A%2F%2F46.4.109.148%3A6969%2Fannounce&tr=udp%3A%2F%2F5.79.249.77%3A6969%2Fannounce&tr=udp%3A%2F%2F5.79.83.193%3A6969%2Fannounce&tr=udp%3A%2F%2F51.254.244.161%3A6969%2Fannounce&tr=udp%3A%2F%2F62.138.0.158%3A6969%2Fannounce&tr=udp%3A%2F%2F62.212.85.66%3A2710%2Fannounce&tr=udp%3A%2F%2F74.82.52.209%3A6969%2Fannounce&tr=udp%3A%2F%2F85.17.19.180%3A80%2Fannounce&tr=udp%3A%2F%2F89.234.156.205%3A80%2Fannounce&tr=udp%3A%2F%2F9.rarbg.com%3A2710%2Fannounce&tr=udp%3A%2F%2F9.rarbg.me%3A2780%2Fannounce&tr=udp%3A%2F%2F9.rarbg.to%3A2730%2Fannounce&tr=udp%3A%2F%2F91.218.230.81%3A6969%2Fannounce&tr=udp%3A%2F%2F94.23.183.33%3A6969%2Fannounce&tr=udp%3A%2F%2Fbt.xxx-tracker.com%3A2710%2Fannounce&tr=udp%3A%2F%2Feddie4.nl%3A6969%2Fannounce&tr=udp%3A%2F%2Fexplodie.org%3A6969%2Fannounce&tr=udp%3A%2F%2Fmgtracker.org%3A2710%2Fannounce&tr=udp%3A%2F%2Fopen.stealth.si%3A80%2Fannounce&tr=udp%3A%2F%2Fp4p.arenabg.com%3A1337%2Fannounce&tr=udp%3A%2F%2Fshadowshq.eddie4.nl%3A6969%2Fannounce&tr=udp%3A%2F%2Fshadowshq.yi.org%3A6969%2Fannounce&tr=udp%3A%2F%2Ftorrent.gresille.org%3A80%2Fannounce&tr=udp%3A%2F%2Ftracker.aletorrenty.pl%3A2710%2Fannounce&tr=udp%3A%2F%2Ftracker.bittor.pw%3A1337%2Fannounce&tr=udp%3A%2F%2Ftracker.coppersurfer.tk%3A6969%2Fannounce&tr=udp%3A%2F%2Ftracker.eddie4.nl%3A6969%2Fannounce&tr=udp%3A%2F%2Ftracker.ex.ua%3A80%2Fannounce&tr=udp%3A%2F%2Ftracker.filetracker.pl%3A8089%2Fannounce&tr=udp%3A%2F%2Ftracker.flashtorrents.org%3A6969%2Fannounce&tr=udp%3A%2F%2Ftracker.grepler.com%3A6969%2Fannounce&tr=udp%3A%2F%2Ftracker.ilibr.org%3A80%2Fannounce&tr=udp%3A%2F%2Ftracker.internetwarriors.net%3A1337%2Fannounce&tr=udp%3A%2F%2Ftracker.kicks-ass.net%3A80%2Fannounce&tr=udp%3A%2F%2Ftracker.kuroy.me%3A5944%2Fannounce&tr=udp%3A%2F%2Ftracker.leechers-paradise.org%3A6969%2Fannounce&tr=udp%3A%2F%2Ftracker.mg64.net%3A2710%2Fannounce&tr=udp%3A%2F%2Ftracker.mg64.net%3A6969%2Fannounce&tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337%2Fannounce&tr=udp%3A%2F%2Ftracker.piratepublic.com%3A1337%2Fannounce&tr=udp%3A%2F%2Ftracker.sktorrent.net%3A6969%2Fannounce&tr=udp%3A%2F%2Ftracker.skyts.net%3A6969%2Fannounce&tr=udp%3A%2F%2Ftracker.tiny-vps.com%3A6969%2Fannounce&tr=udp%3A%2F%2Ftracker.yoshi210.com%3A6969%2Fannounce&tr=udp%3A%2F%2Ftracker2.indowebster.com%3A6969%2Fannounce&tr=udp%3A%2F%2Ftracker4.piratux.com%3A6969%2Fannounce&tr=udp%3A%2F%2Fzer0day.ch%3A1337%2Fannounce&tr=udp%3A%2F%2Fzer0day.to%3A1337%2Fannounce",
-	})
-	if err != nil {
-		t.Error(err)
-		return
-	}
-	if downloadTask.Phase != thunder_browser.PhaseTypeComplete {
-		taskResp, err := client.TaskList(pan.TaskListReq{
-			Ids: []string{downloadTask.Id},
-		})
-		if err != nil {
-			t.Error(err)
-			return
+	found := false
+	for _, item := range list {
+		if item.Name == srcName {
+			found = true
+			break
 		}
-		marshal, err := json.Marshal(taskResp)
-		if err != nil {
-			t.Error(err)
-			return
-		}
-		fmt.Println(string(marshal))
+	}
+	if !found {
+		t.Fatal("moved dir not found in target")
 	}
 }
 
-func TestShare(t *testing.T) {
-	defer GracefulExist()
-	client, err := GetClient(pan.Quark)
-	if err != nil {
-		t.Error(err)
-		return
-	}
-	dir, err := client.Mkdir(pan.MkdirReq{
-		NewPath: "/影视/僵",
-	})
-	if err != nil {
-		t.Error(err)
-		return
-	}
+// TestShareAndDelete 分享创建 -> 列表 -> 删除
+func TestShareAndDelete(t *testing.T) {
+	client := getClient(t)
+	shareDirName := fmt.Sprintf("pan-share-%d", time.Now().UnixMilli())
+	dir := mkdirOrSkip(t, client, testRoot+"/"+shareDirName)
+	defer func() {
+		_ = client.Delete(pan.DeleteReq{Items: []*pan.PanObj{dir}})
+	}()
+
 	share, err := client.NewShare(pan.NewShareReq{
 		Fids:         []string{dir.Id},
-		Title:        "我的分享",
+		Title:        "集成测试分享",
 		NeedPassCode: false,
 		ExpiredType:  1,
 	})
 	if err != nil {
-		t.Error(err)
-		return
+		t.Fatalf("new share: %v", err)
 	}
-	shareList, err := client.ShareList(pan.ShareListReq{
-		ShareIds: []string{share.ShareId},
-	})
+	slog.Info("创建分享", "shareId", share.ShareId)
+
+	shareList, err := client.ShareList(pan.ShareListReq{ShareIds: []string{share.ShareId}})
 	if err != nil {
-		t.Error(err)
-		return
+		t.Fatalf("share list: %v", err)
 	}
-	marshal, err := json.Marshal(shareList)
-	if err != nil {
-		t.Error(err)
-		return
+	if len(shareList) == 0 {
+		t.Fatal("expected at least 1 share")
 	}
-	fmt.Println(string(marshal))
-	err = client.DeleteShare(pan.DelShareReq{
-		ShareIds: []string{share.ShareId},
-	})
+
+	err = client.DeleteShare(pan.DelShareReq{ShareIds: []string{share.ShareId}})
 	if err != nil {
-		t.Error(err)
-		return
+		t.Fatalf("delete share: %v", err)
+	}
+	slog.Info("删除分享成功")
+}
+
+// TestGetProperties 验证 Properties 非 nil
+func TestGetProperties(t *testing.T) {
+	client := getClient(t)
+	props := client.GetProperties()
+	if props == nil {
+		t.Fatal("expected non-nil properties")
 	}
 }
 
-func TestShareRestore(t *testing.T) {
-	defer GracefulExist()
-	client, err := GetClient(pan.Quark)
-	if err != nil {
-		t.Error(err)
-		return
-	}
-	//err = client.ShareRestore(pan.ShareRestoreReq{
-	//	ShareUrl:  "https://pan.xunlei.com/s/VOESxSgsp_Zg1E4WDWxx689sA1?pwd=jab2",
-	//	TargetDir: "/tmpdata",
-	//})
-	//if err != nil {
-	//	t.Error(err)
-	//	return
-	//}
-	err = client.ShareRestore(pan.ShareRestoreReq{
-		ShareUrl:  "https://pan.quark.cn/s/83dae5e77944",
-		PassCode:  "8uSJ",
-		TargetDir: "/tmpdata",
-	})
-	if err != nil {
-		t.Error(err)
-		return
+// TestClientClose 测试 Close + RemoveDriver
+func TestClientClose(t *testing.T) {
+	client := getClient(t)
+	id := client.GetId()
+
+	RemoveDriver(id)
+
+	_, ok := pan.LoadDriver(id)
+	if ok {
+		t.Fatal("expected driver removed from registry")
 	}
 }
 
-// TestDownloadByFilePath 夸克网盘指定文件路径下载测试
-func TestDownloadByFilePath(t *testing.T) {
-	defer GracefulExist()
-	client, err := GetClient(pan.Quark)
-	if err != nil {
-		t.Error(err)
-		return
-	}
+// TestWithContext 传入 ctx 并取消
+func TestWithContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	client := getClient(t, WithContext(ctx))
 
-	remoteFilePath := "/来自：分享/BY.4k/02.4k.mp4"
-	localSavePath := "./tmpdata"
-
-	lastSlash := len(remoteFilePath) - 1
-	for lastSlash >= 0 && remoteFilePath[lastSlash] != '/' {
-		lastSlash--
-	}
-	parentPath := remoteFilePath[:lastSlash]
-	fileName := remoteFilePath[lastSlash+1:]
-
-	list, err := client.List(pan.ListReq{
-		Dir: &pan.PanObj{
-			Path: parentPath,
-			Type: "dir",
-		},
+	_, err := client.List(pan.ListReq{
+		Dir:    testRootDir(),
 		Reload: true,
 	})
 	if err != nil {
-		t.Errorf("获取目录列表失败: %v", err)
-		return
+		t.Fatalf("list before cancel: %v", err)
 	}
 
+	cancel()
+	slog.Info("context cancelled")
+}
+
+// TestWithCustomLogger 自定义 logger
+func TestWithCustomLogger(t *testing.T) {
+	handler := slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug})
+	Init(WithLogger(slog.New(handler)))
+
+	client := getClient(t)
+	_, err := client.List(pan.ListReq{
+		Dir:    testRootDir(),
+		Reload: true,
+	})
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+}
+
+// TestWithDownloadOptions 自定义下载参数
+func TestWithDownloadOptions(t *testing.T) {
+	client := getClient(t,
+		WithDownloadTmpPath("./test_tmp"),
+		WithDownloadMaxThread(5),
+		WithDownloadMaxRetry(1),
+	)
+	_, err := client.Disk()
+	if err != nil {
+		t.Fatalf("disk: %v", err)
+	}
+	slog.Info("自定义下载参数验证通过")
+}
+
+// TestOnChange 属性变更回调
+func TestOnChange(t *testing.T) {
+	changed := false
+	Init()
+	client, err := NewQuarkClient(quark.QuarkProperties{
+		CookieFile: "pan.quark.cn_cookies.txt",
+	}, WithOnChange(func(props pan.Properties) {
+		changed = true
+	}))
+	if err != nil {
+		t.Fatalf("create client: %v", err)
+	}
+
+	_, err = client.List(pan.ListReq{
+		Dir:    testRootDir(),
+		Reload: true,
+	})
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	slog.Info("OnChange", "triggered", changed)
+}
+
+// TestCacheReuse 连续两次 List，第二次命中缓存
+func TestCacheReuse(t *testing.T) {
+	client := getClient(t)
+
+	list1, err := client.List(pan.ListReq{
+		Dir:    testRootDir(),
+		Reload: true,
+	})
+	if err != nil {
+		t.Fatalf("first list: %v", err)
+	}
+
+	list2, err := client.List(pan.ListReq{
+		Dir: testRootDir(),
+	})
+	if err != nil {
+		t.Fatalf("second list: %v", err)
+	}
+
+	if len(list1) != len(list2) {
+		t.Fatalf("expected same count, got %d vs %d", len(list1), len(list2))
+	}
+	slog.Info("缓存命中验证通过", "count", len(list2))
+}
+
+// TestDownloadFile 下载根目录下的第一个文件
+func TestDownloadFile(t *testing.T) {
+	client := getClient(t,
+		WithDownloadTmpPath("./test_download_tmp"),
+		WithDownloadMaxThread(3),
+	)
+
+	// 1. 上传一个临时文件
+	uploadContent := fmt.Sprintf("download-test-content-%d", time.Now().UnixNano())
+	tmpFile, err := os.CreateTemp("", "pan-dl-test-*.txt")
+	if err != nil {
+		t.Fatalf("create temp: %v", err)
+	}
+	_, _ = tmpFile.WriteString(uploadContent)
+	tmpFile.Close()
+	defer os.Remove(tmpFile.Name())
+
+	uploadName := filepath.Base(tmpFile.Name())
+	err = client.UploadFile(pan.UploadFileReq{
+		LocalFile:  tmpFile.Name(),
+		RemotePath: testRoot,
+	})
+	if err != nil {
+		t.Fatalf("upload: %v", err)
+	}
+	slog.Info("上传完成", "name", uploadName)
+
+	// 等待服务端刷新后查找上传的文件
+	time.Sleep(2 * time.Second)
+	list, err := client.List(pan.ListReq{Dir: testRootDir(), Reload: true})
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
 	var targetFile *pan.PanObj
 	for _, item := range list {
-		if item.Type == "file" && item.Name == fileName {
+		if item.Name == uploadName {
 			targetFile = item
 			break
 		}
 	}
-
 	if targetFile == nil {
-		t.Errorf("未找到文件: %s", remoteFilePath)
-		return
+		t.Fatalf("上传的文件 %s 未在列表中找到", uploadName)
 	}
+	defer func() {
+		_ = client.Delete(pan.DeleteReq{Items: []*pan.PanObj{targetFile}})
+	}()
 
+	// 2. 下载并验证
+	localPath := "./test_download_output"
+	_ = os.MkdirAll(localPath, os.ModePerm)
+	defer os.RemoveAll(localPath)
+	defer os.RemoveAll("./test_download_tmp")
+
+	slog.Info("开始下载", "name", targetFile.Name, "size", targetFile.Size)
+	var dlProgressCalled bool
 	err = client.DownloadFile(pan.DownloadFileReq{
 		RemoteFile:  targetFile,
-		LocalPath:   localSavePath,
-		Concurrency: 10,
+		LocalPath:   localPath,
+		Concurrency: 2,
 		ChunkSize:   5 * 1024 * 1024,
 		OverCover:   true,
-		DownloadCallback: func(localPath, localFile string) {
-			logger.Infof("下载完成: %s/%s", localPath, localFile)
+		DownloadCallback: func(localFilePath, localFileName string) {
+			slog.Info("下载完成回调", "path", localFilePath, "file", localFileName)
+		},
+		ProgressCallback: func(event pan.ProgressEvent) {
+			dlProgressCalled = true
+			slog.Info("下载进度", "file", event.FileName, "percent", fmt.Sprintf("%.1f%%", event.Percent), "speed", fmt.Sprintf("%.1fKB/s", event.Speed), "done", event.Done)
 		},
 	})
 	if err != nil {
-		t.Errorf("下载失败: %v", err)
-		return
+		t.Fatalf("download: %v", err)
 	}
-	logger.Info("文件下载成功")
+	if !dlProgressCalled {
+		t.Log("warning: 下载进度回调未触发（文件可能太小）")
+	}
+
+	// 3. 验证下载内容
+	downloadedFile := filepath.Join(localPath, uploadName)
+	data, err := os.ReadFile(downloadedFile)
+	if err != nil {
+		t.Fatalf("read downloaded file: %v", err)
+	}
+	if string(data) != uploadContent {
+		t.Fatalf("内容不匹配: got %q, want %q", string(data), uploadContent)
+	}
+	slog.Info("下载验证通过", "name", uploadName, "size", len(data))
 }
 
-// TestListDir 夸克网盘查看目录下文件
-func TestListDir(t *testing.T) {
-	defer GracefulExist()
-	client, err := GetClient(pan.Quark)
+// TestDownloadPath 下载目录
+func TestDownloadPath(t *testing.T) {
+	client := getClient(t)
+
+	// 1. 创建远程目录
+	dirName := fmt.Sprintf("pan-dlpath-%d", time.Now().UnixMilli())
+	remoteDir := mkdirOrSkip(t, client, testRoot+"/"+dirName)
+	defer func() {
+		_ = client.Delete(pan.DeleteReq{Items: []*pan.PanObj{remoteDir}})
+	}()
+
+	// 2. 上传一个文件到该目录
+	content := fmt.Sprintf("download-path-test-%d", time.Now().UnixNano())
+	tmpFile, err := os.CreateTemp("", "pan-dlpath-*.txt")
 	if err != nil {
-		t.Error(err)
-		return
+		t.Fatalf("create temp: %v", err)
+	}
+	_, _ = tmpFile.WriteString(content)
+	tmpFile.Close()
+	defer os.Remove(tmpFile.Name())
+
+	uploadName := filepath.Base(tmpFile.Name())
+	err = client.UploadFile(pan.UploadFileReq{
+		LocalFile:  tmpFile.Name(),
+		RemotePath: testRoot + "/" + dirName,
+	})
+	if err != nil {
+		t.Fatalf("upload: %v", err)
+	}
+	slog.Info("上传到远程目录", "dir", dirName, "file", uploadName)
+
+	// 等待服务端刷新，并强制 reload 确认文件可见
+	time.Sleep(2 * time.Second)
+	items, err := client.List(pan.ListReq{Dir: remoteDir, Reload: true})
+	if err != nil {
+		t.Fatalf("list remote dir: %v", err)
+	}
+	if len(items) == 0 {
+		t.Fatal("上传后远程目录为空")
+	}
+	slog.Info("远程目录文件数", "count", len(items))
+
+	// 3. 下载整个目录
+	localPath := "./test_download_dir"
+	_ = os.MkdirAll(localPath, os.ModePerm)
+	defer os.RemoveAll(localPath)
+
+	slog.Info("开始下载目录", "name", dirName)
+	err = client.DownloadPath(pan.DownloadPathReq{
+		RemotePath:  remoteDir,
+		LocalPath:   localPath,
+		NotTraverse: true,
+		Concurrency: 2,
+		ChunkSize:   5 * 1024 * 1024,
+		OverCover:   true,
+		SkipFileErr: true,
+	})
+	if err != nil {
+		t.Fatalf("download path: %v", err)
 	}
 
-	// 配置：修改为你要查看的目录路径
-	dirPath := "/来自：分享/BY.4k"
+	// 4. 验证下载内容（DownloadPath 直接将文件放在 localPath 下）
+	downloadedFile := filepath.Join(localPath, uploadName)
+	data, err := os.ReadFile(downloadedFile)
+	if err != nil {
+		t.Fatalf("read downloaded: %v", err)
+	}
+	if string(data) != content {
+		t.Fatalf("内容不匹配: got %q, want %q", string(data), content)
+	}
+	slog.Info("下载目录验证通过", "dir", dirName, "file", uploadName, "size", len(data))
+}
 
-	list, err := client.List(pan.ListReq{
-		Dir: &pan.PanObj{
-			Path: dirPath,
-			Type: "dir",
+// TestUploadFile 上传文件并清理
+func TestUploadFile(t *testing.T) {
+	client := getClient(t)
+
+	tmpFile, err := os.CreateTemp("", "pan-upload-test-*.txt")
+	if err != nil {
+		t.Fatalf("create temp: %v", err)
+	}
+	_, _ = tmpFile.WriteString("pan-client upload integration test\n")
+	tmpFile.Close()
+	defer os.Remove(tmpFile.Name())
+
+	slog.Info("上传文件", "local", tmpFile.Name())
+	var upProgressCalled bool
+	err = client.UploadFile(pan.UploadFileReq{
+		LocalFile:  tmpFile.Name(),
+		RemotePath: testRoot,
+		ProgressCallback: func(event pan.ProgressEvent) {
+			upProgressCalled = true
+			slog.Info("上传进度", "file", event.FileName, "percent", fmt.Sprintf("%.1f%%", event.Percent), "speed", fmt.Sprintf("%.1fKB/s", event.Speed), "done", event.Done)
 		},
-		Reload: true,
+		Resumable:  false,
+		SuccessDel: false,
 	})
 	if err != nil {
-		t.Errorf("获取目录列表失败: %v", err)
-		return
+		t.Fatalf("upload: %v", err)
 	}
+	if !upProgressCalled {
+		t.Log("warning: 上传进度回调未触发（文件可能太小）")
+	}
+	slog.Info("上传成功")
 
-	logger.Infof("目录 %s 下共有 %d 个文件/文件夹:", dirPath, len(list))
-	for i, item := range list {
-		logger.Infof("[%d] %s (%s) - %s", i+1, item.Name, item.Type, item.Path)
-	}
-}
-
-func TestDirectLink(t *testing.T) {
-	defer GracefulExist()
-	//client, err := GetClient(pan.Cloudreve)
-	client, err := GetClientByRw("c3695b6f-6566-400c-bf11-7b08e2c72762", pan.Cloudreve, func(config pan.Properties) error {
-		internal.SetDefaultByTag(config)
-		return internal.Viper.UnmarshalKey(pan.ViperDriverPrefix+string(pan.Cloudreve), config)
-
-	}, func(config pan.Properties) error {
-		internal.Viper.Set(pan.ViperDriverPrefix+string(pan.Cloudreve), config)
-		return internal.Viper.WriteConfig()
-	})
-	if err != nil {
-		t.Error(err)
-		return
-	}
-	list, err := client.List(pan.ListReq{Dir: &pan.PanObj{
-		Path: "/",
-		Name: "test1",
-	}, Reload: true})
-	if err != nil {
-		t.Error(err)
-		return
-	}
-	links := make([]*pan.DirectLink, 0)
-	for _, item := range list {
-		if item.Type == "file" {
-			links = append(links, &pan.DirectLink{
-				FileId: item.Id,
-				Name:   item.Name,
-			})
+	// 尝试清理（服务端可能有延迟，重试2次）
+	baseName := filepath.Base(tmpFile.Name())
+	for retry := 0; retry < 2; retry++ {
+		if retry > 0 {
+			time.Sleep(2 * time.Second)
+		}
+		list, listErr := client.List(pan.ListReq{
+			Dir:    testRootDir(),
+			Reload: true,
+		})
+		if listErr != nil {
+			continue
+		}
+		for _, item := range list {
+			if item.Name == baseName && item.Type == "file" {
+				_ = client.Delete(pan.DeleteReq{Items: []*pan.PanObj{item}})
+				slog.Info("清理上传文件成功", "name", item.Name)
+				return
+			}
 		}
 	}
-	link, err := client.DirectLink(pan.DirectLinkReq{List: links})
-	if err != nil {
-		t.Error(err)
-		return
-	}
-	marshal, err := json.Marshal(link)
-	if err != nil {
-		t.Error(err)
-		return
-	}
-	fmt.Println(string(marshal))
+	t.Log("上传的文件未在列表中找到（可能服务端延迟）")
 }

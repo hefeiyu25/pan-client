@@ -1,16 +1,20 @@
 package pan
 
 import (
+	"context"
 	"fmt"
-	"github.com/hefeiyu2025/pan-client/internal"
-	"github.com/imroc/req/v3"
-	logger "github.com/sirupsen/logrus"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
+
+	"github.com/hefeiyu25/pan-client/internal"
+	"github.com/imroc/req/v3"
+)
+
+const (
+	DefaultCacheTTL = 12 * time.Hour
 )
 
 type DriverConstructor func() Driver
@@ -18,10 +22,9 @@ type DriverConstructor func() Driver
 type DriverType string
 
 const (
-	ViperDriverPrefix string     = "driver."
-	Cloudreve         DriverType = "cloudreve"
-	Quark             DriverType = "quark"
-	ThunderBrowser    DriverType = "thunder_browser"
+	Cloudreve      DriverType = "cloudreve"
+	Quark          DriverType = "quark"
+	ThunderBrowser DriverType = "thunder_browser"
 )
 
 type Properties interface {
@@ -40,14 +43,13 @@ type Driver interface {
 type Meta interface {
 	GetId() string
 	Init() (string, error)
-	InitByCustom(id string, read ConfigRW, write ConfigRW) (string, error)
-	Drop() error
-	ReadConfig() error
-	WriteConfig() error
+	// Close releases all resources held by the driver (cache, goroutines, etc.).
+	Close() error
+	GetProperties() Properties
 	Get(key string) (interface{}, bool)
-	GetOrDefault(key string, defFun DefaultFun) (interface{}, bool, error)
+	GetOrLoad(key string, loader func() (interface{}, error)) (interface{}, error)
 	Set(key string, value interface{})
-	SetDuration(key string, value interface{}, d time.Duration)
+	SetWithTTL(key string, value interface{}, d time.Duration)
 	Del(key string)
 }
 
@@ -69,6 +71,25 @@ type Operate interface {
 }
 
 type BaseOperate struct {
+	DownloadConfig DownloadConfig
+	Ctx            context.Context
+	cancelFunc     context.CancelFunc
+}
+
+// NewBaseOperate creates a BaseOperate with the given config, context, and cancel function.
+func NewBaseOperate(dc DownloadConfig, ctx context.Context, cancel context.CancelFunc) BaseOperate {
+	return BaseOperate{
+		DownloadConfig: dc,
+		Ctx:            ctx,
+		cancelFunc:     cancel,
+	}
+}
+
+// Cancel cancels the client's context, aborting all in-flight operations.
+func (b *BaseOperate) Cancel() {
+	if b.cancelFunc != nil {
+		b.cancelFunc()
+	}
 }
 
 func (b *BaseOperate) BaseUploadPath(req UploadPathReq, UploadFile func(req UploadFileReq) error) error {
@@ -76,7 +97,7 @@ func (b *BaseOperate) BaseUploadPath(req UploadPathReq, UploadFile func(req Uplo
 	if localPath != "" {
 		fileInfo, err := os.Stat(localPath)
 		if err != nil {
-			logger.Errorf("file %s read error %v", localPath, err)
+			internal.GetLogger().Error("file read error", "file", localPath, "error", err)
 			return OnlyError(err)
 		}
 		if !fileInfo.IsDir() {
@@ -88,10 +109,11 @@ func (b *BaseOperate) BaseUploadPath(req UploadPathReq, UploadFile func(req Uplo
 				SuccessDel:         req.SuccessDel,
 				RemotePathTransfer: req.RemotePathTransfer,
 				RemoteNameTransfer: req.RemotePathTransfer,
+				ProgressCallback:   req.ProgressCallback,
 			})
 			return err
 		}
-		logger.Infof("start upload dir %s -> %s", localPath, req.RemotePath)
+		internal.GetLogger().Info("start upload dir", "local", localPath, "remote", req.RemotePath)
 		err = filepath.Walk(localPath, func(path string, info os.FileInfo, err error) error {
 			if err != nil {
 				return err
@@ -106,7 +128,7 @@ func (b *BaseOperate) BaseUploadPath(req UploadPathReq, UploadFile func(req Uplo
 				// 获取相对于root的相对路径
 				relPath, _ := filepath.Rel(localPath, path)
 				relPath = strings.Replace(relPath, "\\", "/", -1)
-				relPath = strings.Replace(relPath, info.Name(), "", 1)
+				relPath = strings.TrimSuffix(relPath, info.Name())
 				NotUpload := false
 				for _, extension := range req.Extensions {
 					if strings.HasSuffix(info.Name(), extension) {
@@ -128,7 +150,7 @@ func (b *BaseOperate) BaseUploadPath(req UploadPathReq, UploadFile func(req Uplo
 					}
 				}
 				if !NotUpload {
-					logger.Infof("start upload file %s -> %s", path, strings.TrimRight(req.RemotePath, "/")+"/"+relPath)
+					internal.GetLogger().Info("start upload file", "local", path, "remote", strings.TrimRight(req.RemotePath, "/")+"/"+relPath)
 					err = UploadFile(UploadFileReq{
 						LocalFile:          path,
 						RemotePath:         strings.TrimRight(req.RemotePath, "/") + "/" + relPath,
@@ -137,19 +159,20 @@ func (b *BaseOperate) BaseUploadPath(req UploadPathReq, UploadFile func(req Uplo
 						SuccessDel:         req.SuccessDel,
 						RemotePathTransfer: req.RemotePathTransfer,
 						RemoteNameTransfer: req.RemotePathTransfer,
+						ProgressCallback:   req.ProgressCallback,
 					})
 					if err == nil {
 						dir := filepath.Dir(path)
-						logger.Infof("uploaded success %s", dir)
+						internal.GetLogger().Info("uploaded success", "dir", dir)
 						if req.SuccessDel {
 							if dir != "." {
 								empty, _ := internal.IsEmptyDir(dir)
 								if empty {
 									err = os.Remove(dir)
 									if err != nil {
-										logger.Errorf("delete fail %s,%v", dir, err)
+										internal.GetLogger().Error("delete fail", "dir", dir, "error", err)
 									} else {
-										logger.Infof("delete success %s", dir)
+										internal.GetLogger().Info("delete success", "dir", dir)
 									}
 								}
 							}
@@ -158,10 +181,10 @@ func (b *BaseOperate) BaseUploadPath(req UploadPathReq, UploadFile func(req Uplo
 						if !req.SkipFileErr {
 							return err
 						} else {
-							logger.Errorf("upload err %v", err)
+							internal.GetLogger().Error("upload error", "error", err)
 						}
 					}
-					logger.Infof("end upload file %s -> %s", path, strings.TrimRight(req.RemotePath, "/")+"/"+relPath)
+					internal.GetLogger().Info("end upload file", "local", path, "remote", strings.TrimRight(req.RemotePath, "/")+"/"+relPath)
 				}
 			}
 			return nil
@@ -169,7 +192,7 @@ func (b *BaseOperate) BaseUploadPath(req UploadPathReq, UploadFile func(req Uplo
 		if err != nil {
 			return err
 		}
-		logger.Infof("end upload dir %s -> %s", localPath, req.RemotePath)
+		internal.GetLogger().Info("end upload dir", "local", localPath, "remote", req.RemotePath)
 		return nil
 	}
 	// 遍历目录
@@ -181,7 +204,7 @@ func (b *BaseOperate) BaseDownloadPath(req DownloadPathReq,
 	DownloadFile func(req DownloadFileReq) error) error {
 	dir := req.RemotePath
 	remotePathName := strings.Trim(dir.Path, "/") + "/" + dir.Name
-	logger.Infof("start download dir %s -> %s", remotePathName, req.LocalPath)
+	internal.GetLogger().Info("start download dir", "remote", remotePathName, "local", req.LocalPath)
 	if dir.Type != "dir" {
 		return OnlyMsg("only support download dir")
 	}
@@ -213,6 +236,7 @@ func (b *BaseOperate) BaseDownloadPath(req DownloadPathReq,
 					ChunkSize:          req.ChunkSize,
 					OverCover:          req.OverCover,
 					DownloadCallback:   req.DownloadCallback,
+					ProgressCallback:   req.ProgressCallback,
 					Extensions:         req.Extensions,
 					IgnorePaths:        req.IgnorePaths,
 					IgnoreExtensions:   req.IgnoreExtensions,
@@ -222,13 +246,13 @@ func (b *BaseOperate) BaseDownloadPath(req DownloadPathReq,
 				}, List, DownloadFile)
 				if err != nil {
 					if req.SkipFileErr {
-						logger.Errorf("download %s,err: %v", objectName, err)
+						internal.GetLogger().Error("download error", "object", objectName, "error", err)
 					} else {
 						return err
 					}
 				}
 			} else {
-				logger.Infof("dir will skip: %s", objectName)
+				internal.GetLogger().Info("dir will skip", "object", objectName)
 			}
 		} else {
 			for _, extension := range req.Extensions {
@@ -258,20 +282,21 @@ func (b *BaseOperate) BaseDownloadPath(req DownloadPathReq,
 					ChunkSize:        req.ChunkSize,
 					OverCover:        req.OverCover,
 					DownloadCallback: req.DownloadCallback,
+					ProgressCallback: req.ProgressCallback,
 				})
 				if err != nil {
 					if req.SkipFileErr {
-						logger.Errorf("download %s,err: %v", objectName, err)
+						internal.GetLogger().Error("download error", "object", objectName, "error", err)
 					} else {
 						return err
 					}
 				}
 			} else {
-				logger.Infof("file will skip: %s", objectName)
+				internal.GetLogger().Info("file will skip", "object", objectName)
 			}
 		}
 	}
-	logger.Infof("end download dir %s -> %s", remotePathName, req.LocalPath)
+	internal.GetLogger().Info("end download dir", "remote", remotePathName, "local", req.LocalPath)
 	return nil
 }
 
@@ -285,7 +310,7 @@ func (b *BaseOperate) BaseDownloadFile(req DownloadFileReq,
 		return OnlyMsg("only support download file")
 	}
 	remoteFileName := strings.Trim(object.Path, "/") + "/" + object.Name
-	logger.Infof("start download file %s", remoteFileName)
+	internal.GetLogger().Info("start download file", "file", remoteFileName)
 	outputFile := req.LocalPath + "/" + object.Name
 	fileInfo, err := internal.IsExistFile(outputFile)
 	if fileInfo != nil && err == nil {
@@ -295,7 +320,7 @@ func (b *BaseOperate) BaseDownloadFile(req DownloadFileReq,
 					abs, _ := filepath.Abs(outputFile)
 					req.DownloadCallback(filepath.Dir(abs), abs)
 				}
-				logger.Infof("end download file %s -> %s", remoteFileName, outputFile)
+				internal.GetLogger().Info("end download file", "file", remoteFileName, "output", outputFile)
 				return nil
 			} else {
 				_ = os.Remove(outputFile)
@@ -306,19 +331,37 @@ func (b *BaseOperate) BaseDownloadFile(req DownloadFileReq,
 	if err != nil {
 		return err
 	}
-	e := internal.NewChunkDownload(url, client).
+	var dlCtx []context.Context
+	if b.Ctx != nil {
+		dlCtx = append(dlCtx, b.Ctx)
+	}
+	cd := internal.NewChunkDownload(url, client).
 		SetFileSize(object.Size).
 		SetChunkSize(req.ChunkSize).
 		SetConcurrency(req.Concurrency).
 		SetOutputFile(outputFile).
-		SetTempRootDir(internal.Config.Server.DownloadTmpPath).
-		Do()
+		SetTempRootDir(b.DownloadConfig.TmpPath).
+		SetMaxRetry(b.DownloadConfig.MaxRetry).
+		SetMaxThread(b.DownloadConfig.MaxThread)
+	if req.ProgressCallback != nil {
+		cd.SetProgressFunc(func(fileName string, operated, totalSize int64, percent, speed float64, done bool) {
+			req.ProgressCallback(ProgressEvent{
+				FileName:  fileName,
+				Operated:  operated,
+				TotalSize: totalSize,
+				Percent:   percent,
+				Speed:     speed,
+				Done:      done,
+			})
+		})
+	}
+	e := cd.Do(dlCtx...)
 	if e != nil {
-		logger.WithError(e).Errorf("error download file %s", remoteFileName)
+		internal.GetLogger().Error("error download file", "file", remoteFileName, "error", e)
 		return e
 	}
 
-	logger.Infof("end download file %s -> %s", remoteFileName, outputFile)
+	internal.GetLogger().Info("end download file", "file", remoteFileName, "output", outputFile)
 	if req.DownloadCallback != nil {
 		abs, _ := filepath.Abs(outputFile)
 		req.DownloadCallback(filepath.Dir(abs), abs)
@@ -333,80 +376,162 @@ type Share interface {
 	ShareRestore(req ShareRestoreReq) error
 }
 
-type ConfigRW func(config Properties) error
+// OnChangeFunc is a callback invoked when driver properties change.
+type OnChangeFunc func(props Properties)
 
 type PropertiesOperate[T Properties] struct {
 	Properties T
 	DriverType DriverType
-	m          sync.RWMutex
-	Read       ConfigRW
-	Write      ConfigRW
+	OnChange   OnChangeFunc
 }
 
 func (c *PropertiesOperate[T]) GetId() string {
 	return c.Properties.GetId()
 }
 
-func (c *PropertiesOperate[T]) ReadConfig() error {
-	internal.SetDefaultByTag(c.Properties)
-	if c.Read != nil {
-		return c.Read(c.Properties)
-	}
-	c.m.RLock()
-	defer c.m.RUnlock()
-	return internal.Viper.UnmarshalKey(ViperDriverPrefix+string(c.DriverType), c.Properties)
+func (c *PropertiesOperate[T]) GetProperties() Properties {
+	return c.Properties
 }
 
-func (c *PropertiesOperate[T]) WriteConfig() error {
-	if c.Write != nil {
-		return c.Write(c.Properties)
+// initDefaults sets default values from struct tags.
+func (c *PropertiesOperate[T]) initDefaults() {
+	internal.SetDefaultByTag(c.Properties)
+}
+
+// NotifyChange triggers the OnChange callback if set.
+func (c *PropertiesOperate[T]) NotifyChange() {
+	if c.OnChange != nil {
+		c.OnChange(c.Properties)
 	}
-	c.m.Lock()
-	defer c.m.Unlock()
-	internal.Viper.Set(ViperDriverPrefix+string(c.DriverType), c.Properties)
-	return internal.Viper.WriteConfig()
 }
 
 type CacheOperate struct {
-	DriverType DriverType
-	w          sync.Mutex
+	DirCache *Cache
+}
+
+func NewCacheOperate(ttl ...time.Duration) CacheOperate {
+	t := DefaultCacheTTL
+	if len(ttl) > 0 && ttl[0] > 0 {
+		t = ttl[0]
+	}
+	return CacheOperate{DirCache: NewCache(t)}
+}
+
+func (c *CacheOperate) StopCache() {
+	if c.DirCache != nil {
+		c.DirCache.Stop()
+	}
 }
 
 func (c *CacheOperate) Get(key string) (interface{}, bool) {
-	return internal.Cache.Get(string(c.DriverType) + "." + key)
+	return c.DirCache.Get(key)
 }
 
-type DefaultFun func() (interface{}, error)
-
-func (c *CacheOperate) GetOrDefault(key string, defFun DefaultFun) (interface{}, bool, error) {
-	result, ok := internal.Cache.Get(string(c.DriverType) + "." + key)
-	if !ok {
-		r, err := defFun()
-		if err != nil {
-			return nil, false, err
-		}
-		c.Set(key, r)
-		result = r
-	}
-	return result, true, nil
+func (c *CacheOperate) GetOrLoad(key string, loader func() (interface{}, error)) (interface{}, error) {
+	return c.DirCache.GetOrLoad(key, loader)
 }
 
 func (c *CacheOperate) Set(key string, value interface{}) {
-	c.w.Lock()
-	defer c.w.Unlock()
-	internal.Cache.SetDefault(string(c.DriverType)+"."+key, value)
+	c.DirCache.Set(key, value)
 }
 
-func (c *CacheOperate) SetDuration(key string, value interface{}, d time.Duration) {
-	c.w.Lock()
-	defer c.w.Unlock()
-	internal.Cache.Set(string(c.DriverType)+"."+key, value, d)
+func (c *CacheOperate) SetWithTTL(key string, value interface{}, d time.Duration) {
+	c.DirCache.SetWithTTL(key, value, d)
 }
 
 func (c *CacheOperate) Del(key string) {
-	c.w.Lock()
-	defer c.w.Unlock()
-	internal.Cache.Delete(string(c.DriverType) + "." + key)
+	c.DirCache.Del(key)
+}
+
+// BaseBatchRename provides a default BatchRename implementation.
+// Drivers can call this with their own List and ObjRename methods.
+func (b *BaseOperate) BaseBatchRename(req BatchRenameReq,
+	List func(req ListReq) ([]*PanObj, error),
+	ObjRename func(req ObjRenameReq) error,
+	BatchRename func(req BatchRenameReq) error) error {
+	objs, err := List(ListReq{
+		Reload: true,
+		Dir:    req.Path,
+	})
+	if err != nil {
+		return err
+	}
+	for _, object := range objs {
+		if object.Type == "dir" {
+			err = BatchRename(BatchRenameReq{
+				Path: object,
+				Func: req.Func,
+			})
+			if err != nil {
+				return err
+			}
+		}
+		newName := req.Func(object)
+		if newName != object.Name {
+			err = ObjRename(ObjRenameReq{
+				Obj:     object,
+				NewName: newName,
+			})
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// CollectItemIds collects IDs from PanObj items, resolving paths when needed.
+// Used by Move/Delete operations in quark and thunder_browser drivers.
+type CollectResult struct {
+	ObjIds       []string
+	ReloadDirIds map[string]bool
+}
+
+func CollectItemIds(items []*PanObj, getPanObj func(path string, mustExist bool, list func(req ListReq) ([]*PanObj, error)) (*PanObj, error), list func(req ListReq) ([]*PanObj, error), forDelete bool) *CollectResult {
+	result := &CollectResult{
+		ObjIds:       make([]string, 0),
+		ReloadDirIds: make(map[string]bool),
+	}
+	for _, item := range items {
+		if item.Id != "0" && item.Id != "" {
+			result.ObjIds = append(result.ObjIds, item.Id)
+			if item.Type == "dir" {
+				result.ReloadDirIds[item.Id] = true
+			} else if forDelete && item.Parent != nil && item.Parent.Id != "" {
+				result.ReloadDirIds[item.Parent.Id] = true
+			}
+		} else if item.Path != "" && item.Path != "/" {
+			obj, err := getPanObj(item.Path, true, list)
+			if err == nil {
+				result.ObjIds = append(result.ObjIds, obj.Id)
+				if obj.Type == "dir" {
+					result.ReloadDirIds[obj.Id] = true
+				} else if forDelete && item.Parent != nil && item.Parent.Id != "" {
+					result.ReloadDirIds[item.Parent.Id] = true
+				}
+			}
+		}
+	}
+	return result
+}
+
+// DownloadConfig holds per-client download settings.
+type DownloadConfig struct {
+	TmpPath   string // temp directory for chunk downloads, default "./download_tmp"
+	MaxThread int    // max concurrent download goroutines, default 50
+	MaxRetry  int    // max retry count per chunk, default 3
+}
+
+func (dc *DownloadConfig) ApplyDefaults() {
+	if dc.TmpPath == "" {
+		dc.TmpPath = "./download_tmp"
+	}
+	if dc.MaxThread <= 0 {
+		dc.MaxThread = 50
+	}
+	if dc.MaxRetry <= 0 {
+		dc.MaxRetry = 3
+	}
 }
 
 type CommonOperate struct {
@@ -475,17 +600,18 @@ func (c *CommonOperate) GetPanObj(path string, mustExist bool, list func(req Lis
 }
 
 type ProgressReader struct {
-	readCloser      io.ReadCloser
-	file            *os.File
-	uploaded        int64
-	chunkSize       int64
-	totalSize       int64
-	currentSize     int64
-	currentUploaded int64
-	currentChunkNum int64
-	finish          bool
-	startTime       time.Time
-	chunkStartTime  time.Time
+	readCloser       io.ReadCloser
+	file             *os.File
+	uploaded         int64
+	chunkSize        int64
+	totalSize        int64
+	currentSize      int64
+	currentUploaded  int64
+	currentChunkNum  int64
+	finish           bool
+	startTime        time.Time
+	chunkStartTime   time.Time
+	progressCallback ProgressCallback
 }
 
 func (pr *ProgressReader) Read(p []byte) (n int, err error) {
@@ -505,6 +631,22 @@ func (pr *ProgressReader) Read(p []byte) (n int, err error) {
 			startTime = pr.startTime
 		}
 		internal.LogProgress("uploading", pr.file.Name(), startTime, pr.currentUploaded, uploaded, pr.totalSize, false)
+		if pr.progressCallback != nil {
+			elapsed := time.Since(startTime).Seconds()
+			var speed float64
+			if elapsed > 0 {
+				speed = float64(pr.currentUploaded) / 1024 / elapsed
+			}
+			percent := float64(uploaded) / float64(pr.totalSize) * 100
+			pr.progressCallback(ProgressEvent{
+				FileName:  pr.file.Name(),
+				Operated:  uploaded,
+				TotalSize: pr.totalSize,
+				Percent:   percent,
+				Speed:     speed,
+				Done:      pr.finish,
+			})
+		}
 	}
 	return n, err
 }
@@ -539,7 +681,7 @@ func (pr *ProgressReader) IsFinish() bool {
 	return pr.finish
 }
 
-func NewProcessReader(localFile string, chunkSize, uploaded int64) (*ProgressReader, DriverErrorInterface) {
+func NewProcessReader(localFile string, chunkSize, uploaded int64, progressCb ...ProgressCallback) (*ProgressReader, DriverErrorInterface) {
 	file, err := os.Open(localFile)
 	if err != nil {
 		return nil, OnlyError(err)
@@ -564,36 +706,64 @@ func NewProcessReader(localFile string, chunkSize, uploaded int64) (*ProgressRea
 			return nil, OnlyMsg(localFile + " seek file failed")
 		}
 	}
+	var cb ProgressCallback
+	if len(progressCb) > 0 {
+		cb = progressCb[0]
+	}
 	return &ProgressReader{
-		file:            file,
-		uploaded:        uploaded,
-		chunkSize:       chunkSize,
-		totalSize:       totalSize,
-		currentChunkNum: chunkNum,
-		startTime:       time.Now(),
-		chunkStartTime:  time.Now(),
+		file:             file,
+		uploaded:         uploaded,
+		chunkSize:        chunkSize,
+		totalSize:        totalSize,
+		currentChunkNum:  chunkNum,
+		startTime:        time.Now(),
+		chunkStartTime:   time.Now(),
+		progressCallback: cb,
 	}, nil
 }
 
 type ProgressWriter struct {
-	startTime time.Time
-	totalSize int64
-	uploaded  int64
-	filename  string
+	startTime        time.Time
+	totalSize        int64
+	uploaded         int64
+	filename         string
+	progressCallback ProgressCallback
 }
 
 func (pw *ProgressWriter) Write(b []byte) (n int, err error) {
 	n = len(b)
 	pw.uploaded += int64(n)
 	internal.LogProgress("uploading", pw.filename, pw.startTime, pw.uploaded, pw.uploaded, pw.totalSize, false)
+	if pw.progressCallback != nil {
+		elapsed := time.Since(pw.startTime).Seconds()
+		var speed float64
+		if elapsed > 0 {
+			speed = float64(pw.uploaded) / 1024 / elapsed
+		}
+		percent := float64(pw.uploaded) / float64(pw.totalSize) * 100
+		done := pw.uploaded >= pw.totalSize
+		pw.progressCallback(ProgressEvent{
+			FileName:  pw.filename,
+			Operated:  pw.uploaded,
+			TotalSize: pw.totalSize,
+			Percent:   percent,
+			Speed:     speed,
+			Done:      done,
+		})
+	}
 	return
 }
 
-func NewProgressWriter(filename string, total int64) *ProgressWriter {
+func NewProgressWriter(filename string, total int64, progressCb ...ProgressCallback) *ProgressWriter {
+	var cb ProgressCallback
+	if len(progressCb) > 0 {
+		cb = progressCb[0]
+	}
 	return &ProgressWriter{
-		startTime: time.Now(),
-		totalSize: total,
-		uploaded:  0,
-		filename:  filename,
+		startTime:        time.Now(),
+		totalSize:        total,
+		uploaded:         0,
+		filename:         filename,
+		progressCallback: cb,
 	}
 }

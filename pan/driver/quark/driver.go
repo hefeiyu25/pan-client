@@ -2,17 +2,18 @@ package quark
 
 import (
 	"fmt"
-	"github.com/google/uuid"
-	"github.com/hefeiyu2025/pan-client/internal"
-	"github.com/hefeiyu2025/pan-client/pan"
-	"github.com/imroc/req/v3"
-	logger "github.com/sirupsen/logrus"
-	"net/http"
+	"net/http/cookiejar"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
+	"github.com/hefeiyu25/pan-client/internal"
+	"github.com/hefeiyu25/pan-client/pan"
+	"github.com/imroc/req/v3"
+	netscapecookiejar "github.com/vanym/golang-netscape-cookiejar"
 )
 
 type Quark struct {
@@ -26,8 +27,7 @@ type Quark struct {
 
 type QuarkProperties struct {
 	Id          string `mapstructure:"id" json:"id" yaml:"id"`
-	Pus         string `mapstructure:"pus" json:"pus" yaml:"pus"`
-	Puus        string `mapstructure:"puus" json:"puus" yaml:"puus"`
+	CookieFile  string `mapstructure:"cookie_file" json:"cookie_file" yaml:"cookie_file"` // cookies.txt 文件路径（Netscape 格式）
 	RefreshTime int64  `mapstructure:"refresh_time" json:"refresh_time" yaml:"refresh_time" default:"0"`
 	ChunkSize   int64  `mapstructure:"chunk_size" json:"chunk_size" yaml:"chunk_size" default:"314572800"` // 300M
 }
@@ -48,15 +48,38 @@ func (cp *QuarkProperties) GetDriverType() pan.DriverType {
 }
 
 func (q *Quark) Init() (string, error) {
-	err := q.ReadConfig()
-	if err != nil {
-		return "", err
-	}
 	driverId := q.GetId()
-	if q.Properties.Pus == "" || q.Properties.Puus == "" {
-		_ = q.WriteConfig()
-		return driverId, fmt.Errorf("please set pus and puus")
+
+	if q.Properties.CookieFile == "" {
+		return driverId, fmt.Errorf("please set cookie_file to a valid cookies.txt path")
 	}
+
+	// 创建支持自动回写的 Netscape cookie jar
+	subJar, err := cookiejar.New(nil)
+	if err != nil {
+		return driverId, fmt.Errorf("failed to create cookie jar: %w", err)
+	}
+	jar, err := netscapecookiejar.New(&netscapecookiejar.Options{
+		SubJar:        subJar,
+		AutoWritePath: q.Properties.CookieFile,
+		WriteHeader:   true,
+	})
+	if err != nil {
+		return driverId, fmt.Errorf("failed to create netscape cookie jar: %w", err)
+	}
+
+	// 从 cookies.txt 加载 cookies
+	file, err := os.Open(q.Properties.CookieFile)
+	if err != nil {
+		return driverId, fmt.Errorf("failed to open cookies.txt: %w", err)
+	}
+	_, err = jar.ReadFrom(file)
+	file.Close()
+	if err != nil {
+		return driverId, fmt.Errorf("failed to read cookies.txt: %w", err)
+	}
+	internal.GetLogger().Info("loaded cookies", "file", q.Properties.CookieFile)
+
 	q.sessionClient = req.C().
 		SetCommonHeaders(map[string]string{
 			HeaderUserAgent: DefaultUserAgent,
@@ -65,7 +88,7 @@ func (q *Quark) Init() (string, error) {
 		}).
 		SetCommonQueryParam("pr", "ucpro").
 		SetCommonQueryParam("fr", "pc").
-		SetCommonCookies(&http.Cookie{Name: CookiePusKey, Value: q.Properties.Pus}, &http.Cookie{Name: CookiePuusKey, Value: q.Properties.Puus}).
+		SetCookieJar(jar).
 		SetTimeout(30 * time.Minute).SetBaseURL("https://drive.quark.cn/1/clouddrive")
 	q.defaultClient = req.C().SetTimeout(30 * time.Minute)
 	// 若一小时内更新过，则不重新刷session
@@ -74,24 +97,17 @@ func (q *Quark) Init() (string, error) {
 		if err != nil {
 			return driverId, err
 		} else {
-			err = q.WriteConfig()
-			if err != nil {
-				return driverId, err
-			}
+			q.Properties.RefreshTime = time.Now().UnixMilli()
+			q.NotifyChange()
 		}
 	}
 	return driverId, nil
 }
 
-func (q *Quark) InitByCustom(id string, read pan.ConfigRW, write pan.ConfigRW) (string, error) {
-	q.Properties = &QuarkProperties{Id: id}
-	q.PropertiesOperate.Write = write
-	q.PropertiesOperate.Read = read
-	return q.Init()
-}
-
-func (q *Quark) Drop() error {
-	return pan.OnlyMsg("not support")
+func (q *Quark) Close() error {
+	q.Cancel()
+	q.StopCache()
+	return nil
 }
 
 func (q *Quark) Disk() (*pan.DiskResp, error) {
@@ -121,10 +137,10 @@ func (q *Quark) List(req pan.ListReq) ([]*pan.PanObj, error) {
 	if req.Reload {
 		q.Del(cacheKey)
 	}
-	panObjs, exist, err := q.GetOrDefault(cacheKey, func() (interface{}, error) {
+	result, err := q.GetOrLoad(cacheKey, func() (interface{}, error) {
 		files, e := q.fileSort(queryDir.Id)
 		if e != nil {
-			logger.Error(e)
+			internal.GetLogger().Error("file sort error", "error", e)
 			return nil, e
 		}
 		panObjs := make([]*pan.PanObj, 0)
@@ -151,11 +167,8 @@ func (q *Quark) List(req pan.ListReq) ([]*pan.PanObj, error) {
 	if err != nil {
 		return make([]*pan.PanObj, 0), err
 	}
-	if exist {
-		objs, ok := panObjs.([]*pan.PanObj)
-		if ok {
-			return objs, nil
-		}
+	if objs, ok := result.([]*pan.PanObj); ok {
+		return objs, nil
 	}
 	return make([]*pan.PanObj, 0), nil
 }
@@ -180,36 +193,7 @@ func (q *Quark) ObjRename(req pan.ObjRenameReq) error {
 	return nil
 }
 func (q *Quark) BatchRename(req pan.BatchRenameReq) error {
-	objs, err := q.List(pan.ListReq{
-		Reload: true,
-		Dir:    req.Path,
-	})
-	if err != nil {
-		return err
-	}
-	for _, object := range objs {
-		if object.Type == "dir" {
-			err = q.BatchRename(pan.BatchRenameReq{
-				Path: object,
-				Func: req.Func,
-			})
-			if err != nil {
-				return err
-			}
-		}
-		newName := req.Func(object)
-
-		if newName != object.Name {
-			err = q.ObjRename(pan.ObjRenameReq{
-				Obj:     object,
-				NewName: newName,
-			})
-			if err != nil {
-				return err
-			}
-		}
-	}
-	return nil
+	return q.BaseBatchRename(req, q.List, q.ObjRename, q.BatchRename)
 }
 func (q *Quark) Mkdir(req pan.MkdirReq) (*pan.PanObj, error) {
 	if req.NewPath == "" {
@@ -247,17 +231,82 @@ func (q *Quark) Mkdir(req pan.MkdirReq) (*pan.PanObj, error) {
 		}
 		split := strings.Split(rel, "/")
 		targetDirId := obj.Id
+		var lastDirName string
 		for _, s := range split {
-			resp, err := q.createDirectory(s, targetDirId)
+			// 先查已有子目录，避免不必要的创建请求（防止 file is doloading）
+			existFid := q.findChildDirId(targetDirId, s)
+			if existFid != "" {
+				targetDirId = existFid
+				lastDirName = s
+				continue
+			}
+
+			var resp *RespData[Dir]
+			var err pan.DriverErrorInterface
+			// 重试逻辑：file is doloading 时递增等待重试（最多3次）
+			for attempt := 0; attempt <= 3; attempt++ {
+				resp, err = q.createDirectory(s, targetDirId)
+				if err == nil {
+					break
+				}
+				if !strings.Contains(err.GetMsg(), "file is doloading") {
+					break
+				}
+				if attempt < 3 {
+					wait := time.Duration(attempt+1) * time.Second
+					internal.GetLogger().Warn("file is doloading, retrying", "name", s, "attempt", attempt+1, "wait", wait)
+					time.Sleep(wait)
+				}
+			}
 			if err != nil {
+				// 冲突时刷新缓存再查一次
+				q.Del(cacheDirectoryPrefix + targetDirId)
+				existFid = q.findChildDirId(targetDirId, s)
+				if existFid != "" {
+					targetDirId = existFid
+					lastDirName = s
+					continue
+				}
 				return nil, pan.OnlyError(err)
 			}
 			targetDirId = resp.Data.Fid
+			lastDirName = s
 		}
+		// 清除父目录缓存以便后续 List 可见
 		q.Del(cacheDirectoryPrefix + obj.Id)
-		return q.Mkdir(req)
+		parentPath := targetPath[:len(targetPath)-len(lastDirName)-1]
+		if parentPath == "" {
+			parentPath = "/"
+		}
+		return &pan.PanObj{
+			Id:   targetDirId,
+			Name: lastDirName,
+			Path: parentPath,
+			Type: "dir",
+			Parent: &pan.PanObj{
+				Id:   obj.Id,
+				Path: obj.Path,
+				Name: obj.Name,
+				Type: "dir",
+			},
+		}, nil
 	}
 }
+
+// findChildDirId 在指定父目录下查找名为 name 的子目录，返回其 fid
+func (q *Quark) findChildDirId(parentId, name string) string {
+	files, err := q.fileSort(parentId)
+	if err != nil {
+		return ""
+	}
+	for _, f := range files {
+		if f.FileName == name && f.Dir {
+			return f.Fid
+		}
+	}
+	return ""
+}
+
 func (q *Quark) Move(req pan.MovieReq) error {
 	targetObj := req.TargetObj
 	if targetObj.Type == "file" {
@@ -273,29 +322,12 @@ func (q *Quark) Move(req pan.MovieReq) error {
 		}
 		targetObj = create
 	}
-	reloadDirId := make(map[string]any)
-	objIds := make([]string, 0)
-	for _, item := range req.Items {
-		if item.Id != "0" && item.Id != "" {
-			objIds = append(objIds, item.Id)
-			if item.Type == "dir" {
-				reloadDirId[item.Id] = true
-			}
-		} else if item.Path != "" && item.Path != "/" {
-			obj, err := q.GetPanObj(item.Path, true, q.List)
-			if err == nil {
-				objIds = append(objIds, obj.Id)
-				if obj.Type == "dir" {
-					reloadDirId[obj.Id] = true
-				}
-			}
-		}
-	}
-	err := q.objectMove(objIds, targetObj.Id)
+	collected := pan.CollectItemIds(req.Items, q.GetPanObj, q.List, false)
+	err := q.objectMove(collected.ObjIds, targetObj.Id)
 	if err != nil {
 		return pan.OnlyError(err)
 	}
-	for key := range reloadDirId {
+	for key := range collected.ReloadDirIds {
 		q.Del(cacheDirectoryPrefix + key)
 	}
 	return nil
@@ -304,40 +336,16 @@ func (q *Quark) Delete(req pan.DeleteReq) error {
 	if len(req.Items) == 0 {
 		return nil
 	}
-	reloadDirId := make(map[string]any)
-	objIds := make([]string, 0)
-	for _, item := range req.Items {
-		if item.Id != "0" && item.Id != "" {
-			objIds = append(objIds, item.Id)
-			if item.Type == "dir" {
-				reloadDirId[item.Id] = true
-			} else {
-				if item.Parent.Id != "" {
-					reloadDirId[item.Parent.Id] = true
-				}
-			}
-		} else if item.Path != "" && item.Path != "/" {
-			obj, err := q.GetPanObj(item.Path, true, q.List)
-			if err == nil {
-				objIds = append(objIds, obj.Id)
-				if obj.Type == "dir" {
-					reloadDirId[obj.Id] = true
-				} else {
-					reloadDirId[item.Parent.Id] = true
-				}
-			}
-		}
-	}
-	if len(objIds) > 0 {
-		err := q.objectDelete(objIds)
+	collected := pan.CollectItemIds(req.Items, q.GetPanObj, q.List, true)
+	if len(collected.ObjIds) > 0 {
+		err := q.objectDelete(collected.ObjIds)
 		if err != nil {
 			return err
 		}
-		for key := range reloadDirId {
+		for key := range collected.ReloadDirIds {
 			q.Del(cacheDirectoryPrefix + key)
 		}
 	}
-
 	return nil
 }
 
@@ -347,7 +355,7 @@ func (q *Quark) UploadPath(req pan.UploadPathReq) error {
 
 func (q *Quark) UploadFile(req pan.UploadFileReq) error {
 	if req.Resumable {
-		logger.Warn("quark is not support resumeable")
+		internal.GetLogger().Warn("quark is not support resumeable")
 	}
 	stat, err := os.Stat(req.LocalFile)
 	if err != nil {
@@ -405,21 +413,21 @@ func (q *Quark) UploadFile(req pan.UploadFileReq) error {
 		return err
 	}
 	if finish.Data.Finish {
-		logger.Infof("upload fast success %s", req.LocalFile)
+		internal.GetLogger().Info("upload fast success", "file", req.LocalFile)
 		// 上传成功则移除文件了
 		if req.SuccessDel {
 			err = os.Remove(req.LocalFile)
 			if err != nil {
-				logger.Errorf("delete fail %s,%v", req.LocalFile, err)
+				internal.GetLogger().Error("delete fail", "file", req.LocalFile, "error", err)
 			} else {
-				logger.Infof("delete success %s", req.LocalFile)
+				internal.GetLogger().Info("delete success", "file", req.LocalFile)
 			}
 		}
 		return nil
 	}
 
 	if req.OnlyFast {
-		logger.Infof("upload fast error %s", req.LocalFile)
+		internal.GetLogger().Info("upload fast error", "file", req.LocalFile)
 		return pan.OnlyMsg("only support fast error:" + req.LocalFile)
 	}
 
@@ -428,7 +436,7 @@ func (q *Quark) UploadFile(req pan.UploadFileReq) error {
 	total := stat.Size()
 	left := total
 	partNumber := 1
-	pr, err := pan.NewProcessReader(req.LocalFile, partSize, 0)
+	pr, err := pan.NewProcessReader(req.LocalFile, partSize, 0, req.ProgressCallback)
 	if err != nil {
 		return err
 	}
@@ -452,14 +460,14 @@ func (q *Quark) UploadFile(req pan.UploadFileReq) error {
 			return e
 		}
 		if m == "finish" {
-			logger.Infof("upload success:%s", req.LocalFile)
+			internal.GetLogger().Info("upload success", "file", req.LocalFile)
 			// 上传成功则移除文件了
 			if req.SuccessDel {
 				err = os.Remove(req.LocalFile)
 				if err != nil {
-					logger.Errorf("delete fail %s,%v", req.LocalFile, err)
+					internal.GetLogger().Error("delete fail", "file", req.LocalFile, "error", err)
 				} else {
-					logger.Infof("delete success %s", req.LocalFile)
+					internal.GetLogger().Info("delete success", "file", req.LocalFile)
 				}
 			}
 			return nil
@@ -487,14 +495,14 @@ func (q *Quark) UploadFile(req pan.UploadFileReq) error {
 	if err != nil {
 		return err
 	}
-	logger.Infof("upload success %s", req.LocalFile)
+	internal.GetLogger().Info("upload success", "file", req.LocalFile)
 	// 上传成功则移除文件了
 	if req.SuccessDel {
 		err = os.Remove(req.LocalFile)
 		if err != nil {
-			logger.Errorf("delete fail %s,%v", req.LocalFile, err)
+			internal.GetLogger().Error("delete fail", "file", req.LocalFile, "error", err)
 		} else {
-			logger.Infof("delete success %s", req.LocalFile)
+			internal.GetLogger().Info("delete success", "file", req.LocalFile)
 		}
 	}
 	return nil
@@ -639,7 +647,7 @@ func init() {
 			PropertiesOperate: pan.PropertiesOperate[*QuarkProperties]{
 				DriverType: pan.Quark,
 			},
-			CacheOperate:  pan.CacheOperate{DriverType: pan.Quark},
+			CacheOperate:  pan.NewCacheOperate(),
 			CommonOperate: pan.CommonOperate{},
 		}
 	})
