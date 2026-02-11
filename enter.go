@@ -17,6 +17,7 @@ type clientOptions struct {
 	onChange       pan.OnChangeFunc
 	ctx            context.Context
 	downloadConfig pan.DownloadConfig
+	proxyConfig    pan.ProxyConfig
 }
 
 // ClientOption configures a client.
@@ -56,6 +57,14 @@ func WithDownloadMaxThread(n int) ClientOption {
 func WithDownloadMaxRetry(n int) ClientOption {
 	return func(o *clientOptions) {
 		o.downloadConfig.MaxRetry = n
+	}
+}
+
+// WithProxy sets the proxy URL for this driver instance.
+// Supports http://host:port and socks5://host:port.
+func WithProxy(proxyURL string) ClientOption {
+	return func(o *clientOptions) {
+		o.proxyConfig.ProxyURL = proxyURL
 	}
 }
 
@@ -141,7 +150,7 @@ func NewCloudreveClient(props cloudreve.CloudreveProperties, opts ...ClientOptio
 }
 
 func newBaseOperate(o *clientOptions, cancel context.CancelFunc) pan.BaseOperate {
-	return pan.NewBaseOperate(o.downloadConfig, o.ctx, cancel)
+	return pan.NewBaseOperate(o.downloadConfig, o.proxyConfig, o.ctx, cancel)
 }
 
 // RemoveDriver removes a cached driver by id.

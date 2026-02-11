@@ -102,6 +102,11 @@ func (tb *ThunderBrowser) Init() (string, error) {
 	}
 
 	tb.downloadClient = req.C().SetCommonHeader(HeaderUserAgent, DownloadUserAgent)
+	// 应用代理配置
+	if tb.ProxyConfig.ProxyURL != "" {
+		tb.sessionClient.SetProxyURL(tb.ProxyConfig.ProxyURL)
+		tb.downloadClient.SetProxyURL(tb.ProxyConfig.ProxyURL)
+	}
 
 	tb.NotifyChange()
 	return driverId, nil
@@ -294,21 +299,22 @@ func (tb *ThunderBrowser) Delete(req pan.DeleteReq) error {
 	return nil
 }
 
-func (tb *ThunderBrowser) UploadPath(req pan.UploadPathReq) error {
-	return tb.BaseUploadPath(req, tb.UploadFile)
+func (tb *ThunderBrowser) UploadPath(req pan.UploadPathReq) (*pan.TransferResult, error) {
+	err := tb.BaseUploadPath(req, tb.UploadFile)
+	return nil, err
 }
 
-func (tb *ThunderBrowser) UploadFile(req pan.UploadFileReq) error {
+func (tb *ThunderBrowser) UploadFile(req pan.UploadFileReq) (*pan.TransferResult, error) {
 	if req.Resumable {
 		internal.GetLogger().Warn("thunder_browser is not support resumeable")
 	}
 	if req.OnlyFast {
-		return pan.OnlyMsg("thunder_browser is not support fast upload")
+		return nil, pan.OnlyMsg("thunder_browser is not support fast upload")
 	}
 
 	stat, err := os.Stat(req.LocalFile)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	remoteName := stat.Name()
 	remotePath := strings.TrimRight(req.RemotePath, "/")
@@ -322,18 +328,18 @@ func (tb *ThunderBrowser) UploadFile(req pan.UploadFileReq) error {
 	_, err = tb.GetPanObj(remoteAllPath, true, tb.List)
 	// 没有报错证明文件已经存在
 	if err == nil {
-		return pan.CodeMsg(CodeObjectExist, remoteAllPath+" is exist")
+		return nil, pan.CodeMsg(CodeObjectExist, remoteAllPath+" is exist")
 	}
 	dir, err := tb.Mkdir(pan.MkdirReq{
 		NewPath: remotePath,
 	})
 	if err != nil {
-		return pan.MsgError(remotePath+" create error", err)
+		return nil, pan.MsgError(remotePath+" create error", err)
 	}
 
 	gcid, err := internal.GetFileGcid(req.LocalFile)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	parentId := dir.Id
 	if parentId == "0" {
@@ -350,8 +356,12 @@ func (tb *ThunderBrowser) UploadFile(req pan.UploadFileReq) error {
 	})
 
 	if err != nil {
-		return err
+		return nil, err
 	}
+
+	// 使用网盘返回的文件 ID
+	fileTaskId := resp.File.ID
+	result := &pan.TransferResult{TaskId: fileTaskId}
 
 	param := resp.Resumable.Params
 	if resp.UploadType == UploadTypeResumable {
@@ -367,7 +377,7 @@ func (tb *ThunderBrowser) UploadFile(req pan.UploadFileReq) error {
 		}
 		file, err := os.Open(req.LocalFile)
 		if err != nil {
-			return err
+			return result, err
 		}
 		_, err = uploader.Upload(context.Background(), &s3.PutObjectInput{
 			Bucket:  aws.String(param.Bucket),
@@ -384,17 +394,18 @@ func (tb *ThunderBrowser) UploadFile(req pan.UploadFileReq) error {
 				internal.GetLogger().Info("delete success", "file", req.LocalFile)
 			}
 		}
-		return err
+		return result, err
 	}
 
-	return nil
+	return result, nil
 }
 
-func (tb *ThunderBrowser) DownloadPath(req pan.DownloadPathReq) error {
-	return tb.BaseDownloadPath(req, tb.List, tb.DownloadFile)
+func (tb *ThunderBrowser) DownloadPath(req pan.DownloadPathReq) (*pan.TransferResult, error) {
+	err := tb.BaseDownloadPath(req, tb.List, tb.DownloadFile)
+	return nil, err
 }
-func (tb *ThunderBrowser) DownloadFile(req pan.DownloadFileReq) error {
-	return tb.BaseDownloadFile(req, tb.downloadClient, func(req pan.DownloadFileReq) (string, error) {
+func (tb *ThunderBrowser) DownloadFile(req pan.DownloadFileReq) (*pan.TransferResult, error) {
+	err := tb.BaseDownloadFile(req, tb.downloadClient, func(req pan.DownloadFileReq) (string, error) {
 		link, err := tb.getLink(req.RemoteFile.Id)
 		if err != nil {
 			return "", err
@@ -415,6 +426,7 @@ func (tb *ThunderBrowser) DownloadFile(req pan.DownloadFileReq) error {
 		}
 		return downloadLink, nil
 	})
+	return nil, err
 }
 
 func (tb *ThunderBrowser) OfflineDownload(req pan.OfflineDownloadReq) (*pan.Task, error) {

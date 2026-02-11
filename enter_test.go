@@ -364,7 +364,7 @@ func TestDownloadFile(t *testing.T) {
 	defer os.Remove(tmpFile.Name())
 
 	uploadName := filepath.Base(tmpFile.Name())
-	err = client.UploadFile(pan.UploadFileReq{
+	_, err = client.UploadFile(pan.UploadFileReq{
 		LocalFile:  tmpFile.Name(),
 		RemotePath: testRoot,
 	})
@@ -401,14 +401,14 @@ func TestDownloadFile(t *testing.T) {
 
 	slog.Info("开始下载", "name", targetFile.Name, "size", targetFile.Size)
 	var dlProgressCalled bool
-	err = client.DownloadFile(pan.DownloadFileReq{
+	_, err = client.DownloadFile(pan.DownloadFileReq{
 		RemoteFile:  targetFile,
 		LocalPath:   localPath,
 		Concurrency: 2,
 		ChunkSize:   5 * 1024 * 1024,
 		OverCover:   true,
-		DownloadCallback: func(localFilePath, localFileName string) {
-			slog.Info("下载完成回调", "path", localFilePath, "file", localFileName)
+		DownloadCallback: func(taskId, fileTaskId, localFilePath, localFileName string) {
+			slog.Info("下载完成回调", "taskId", taskId, "fileTaskId", fileTaskId, "path", localFilePath, "file", localFileName)
 		},
 		ProgressCallback: func(event pan.ProgressEvent) {
 			dlProgressCalled = true
@@ -456,7 +456,7 @@ func TestDownloadPath(t *testing.T) {
 	defer os.Remove(tmpFile.Name())
 
 	uploadName := filepath.Base(tmpFile.Name())
-	err = client.UploadFile(pan.UploadFileReq{
+	_, err = client.UploadFile(pan.UploadFileReq{
 		LocalFile:  tmpFile.Name(),
 		RemotePath: testRoot + "/" + dirName,
 	})
@@ -482,7 +482,7 @@ func TestDownloadPath(t *testing.T) {
 	defer os.RemoveAll(localPath)
 
 	slog.Info("开始下载目录", "name", dirName)
-	err = client.DownloadPath(pan.DownloadPathReq{
+	_, err = client.DownloadPath(pan.DownloadPathReq{
 		RemotePath:  remoteDir,
 		LocalPath:   localPath,
 		NotTraverse: true,
@@ -521,7 +521,7 @@ func TestUploadFile(t *testing.T) {
 
 	slog.Info("上传文件", "local", tmpFile.Name())
 	var upProgressCalled bool
-	err = client.UploadFile(pan.UploadFileReq{
+	_, err = client.UploadFile(pan.UploadFileReq{
 		LocalFile:  tmpFile.Name(),
 		RemotePath: testRoot,
 		ProgressCallback: func(event pan.ProgressEvent) {

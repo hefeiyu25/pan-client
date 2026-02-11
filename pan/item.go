@@ -53,14 +53,28 @@ type PanObj struct {
 }
 type RemoteTransfer func(remote string) string
 
+// TransferResult 传输任务结果
+type TransferResult struct {
+	TaskId    string              `json:"taskId"`              // 任务 ID（来自网盘的目录/文件 ID）
+	FileItems []*TransferFileItem `json:"fileItems,omitempty"` // 目录任务时，各子文件信息
+}
+
+// TransferFileItem 单个文件的传输信息
+type TransferFileItem struct {
+	FileTaskId string `json:"fileTaskId"` // 文件 ID（来自网盘）
+	FileName   string `json:"fileName"`   // 文件名
+}
+
 // ProgressEvent 传输进度事件
 type ProgressEvent struct {
-	FileName  string  // 当前文件名
-	Operated  int64   // 已传输字节
-	TotalSize int64   // 总字节
-	Percent   float64 // 百分比 0-100
-	Speed     float64 // KB/s
-	Done      bool    // 是否完成
+	TaskId     string  // 任务 ID（目录级或文件级，来自网盘）
+	FileTaskId string  // 文件级 ID（目录任务时区分子文件）
+	FileName   string  // 当前文件名
+	Operated   int64   // 已传输字节
+	TotalSize  int64   // 总字节
+	Percent    float64 // 百分比 0-100
+	Speed      float64 // KB/s
+	Done       bool    // 是否完成
 }
 
 // ProgressCallback 传输进度回调
@@ -93,7 +107,7 @@ type UploadPathReq struct {
 	ProgressCallback   ProgressCallback
 }
 
-type DownloadCallback func(localPath, localFile string)
+type DownloadCallback func(taskId, fileTaskId, localPath, localFile string)
 
 type DownloadPathReq struct {
 	RemotePath  *PanObj `json:"remotePath,omitempty"`
@@ -119,6 +133,7 @@ type DownloadFileReq struct {
 	Concurrency      int     `json:"concurrency,omitempty"`
 	ChunkSize        int64   `json:"chunkSize,omitempty"`
 	OverCover        bool    `json:"overCover,omitempty"`
+	TaskId           string  `json:"taskId,omitempty"` // 目录级任务 ID（由 DownloadPath 传入，单文件下载可留空）
 	DownloadCallback `json:"downloadCallback,omitempty"`
 	ProgressCallback ProgressCallback
 }

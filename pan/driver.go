@@ -61,25 +61,32 @@ type Operate interface {
 	Mkdir(req MkdirReq) (*PanObj, error)
 	Move(req MovieReq) error
 	Delete(req DeleteReq) error
-	UploadPath(req UploadPathReq) error
-	UploadFile(req UploadFileReq) error
-	DownloadPath(req DownloadPathReq) error
-	DownloadFile(req DownloadFileReq) error
+	UploadPath(req UploadPathReq) (*TransferResult, error)
+	UploadFile(req UploadFileReq) (*TransferResult, error)
+	DownloadPath(req DownloadPathReq) (*TransferResult, error)
+	DownloadFile(req DownloadFileReq) (*TransferResult, error)
 	OfflineDownload(req OfflineDownloadReq) (*Task, error)
 	TaskList(req TaskListReq) ([]*Task, error)
 	DirectLink(req DirectLinkReq) ([]*DirectLink, error)
 }
 
+// ProxyConfig holds proxy settings for a driver instance.
+type ProxyConfig struct {
+	ProxyURL string // 支持 http://host:port 或 socks5://host:port
+}
+
 type BaseOperate struct {
 	DownloadConfig DownloadConfig
+	ProxyConfig    ProxyConfig
 	Ctx            context.Context
 	cancelFunc     context.CancelFunc
 }
 
 // NewBaseOperate creates a BaseOperate with the given config, context, and cancel function.
-func NewBaseOperate(dc DownloadConfig, ctx context.Context, cancel context.CancelFunc) BaseOperate {
+func NewBaseOperate(dc DownloadConfig, pc ProxyConfig, ctx context.Context, cancel context.CancelFunc) BaseOperate {
 	return BaseOperate{
 		DownloadConfig: dc,
+		ProxyConfig:    pc,
 		Ctx:            ctx,
 		cancelFunc:     cancel,
 	}
@@ -92,7 +99,7 @@ func (b *BaseOperate) Cancel() {
 	}
 }
 
-func (b *BaseOperate) BaseUploadPath(req UploadPathReq, UploadFile func(req UploadFileReq) error) error {
+func (b *BaseOperate) BaseUploadPath(req UploadPathReq, UploadFile func(req UploadFileReq) (*TransferResult, error)) error {
 	localPath := req.LocalPath
 	if localPath != "" {
 		fileInfo, err := os.Stat(localPath)
@@ -101,7 +108,7 @@ func (b *BaseOperate) BaseUploadPath(req UploadPathReq, UploadFile func(req Uplo
 			return OnlyError(err)
 		}
 		if !fileInfo.IsDir() {
-			err = UploadFile(UploadFileReq{
+			_, err = UploadFile(UploadFileReq{
 				LocalFile:          localPath,
 				RemotePath:         req.RemotePath,
 				Resumable:          req.Resumable,
@@ -151,7 +158,7 @@ func (b *BaseOperate) BaseUploadPath(req UploadPathReq, UploadFile func(req Uplo
 				}
 				if !NotUpload {
 					internal.GetLogger().Info("start upload file", "local", path, "remote", strings.TrimRight(req.RemotePath, "/")+"/"+relPath)
-					err = UploadFile(UploadFileReq{
+					_, err = UploadFile(UploadFileReq{
 						LocalFile:          path,
 						RemotePath:         strings.TrimRight(req.RemotePath, "/") + "/" + relPath,
 						OnlyFast:           req.OnlyFast,
@@ -201,7 +208,7 @@ func (b *BaseOperate) BaseUploadPath(req UploadPathReq, UploadFile func(req Uplo
 
 func (b *BaseOperate) BaseDownloadPath(req DownloadPathReq,
 	List func(req ListReq) ([]*PanObj, error),
-	DownloadFile func(req DownloadFileReq) error) error {
+	DownloadFile func(req DownloadFileReq) (*TransferResult, error)) error {
 	dir := req.RemotePath
 	remotePathName := strings.Trim(dir.Path, "/") + "/" + dir.Name
 	internal.GetLogger().Info("start download dir", "remote", remotePathName, "local", req.LocalPath)
@@ -275,7 +282,7 @@ func (b *BaseOperate) BaseDownloadPath(req DownloadPathReq,
 				}
 			}
 			if !NotDownload {
-				err = DownloadFile(DownloadFileReq{
+				_, err = DownloadFile(DownloadFileReq{
 					RemoteFile:       object,
 					LocalPath:        req.LocalPath,
 					Concurrency:      req.Concurrency,
@@ -318,7 +325,7 @@ func (b *BaseOperate) BaseDownloadFile(req DownloadFileReq,
 			if !req.OverCover {
 				if req.DownloadCallback != nil {
 					abs, _ := filepath.Abs(outputFile)
-					req.DownloadCallback(filepath.Dir(abs), abs)
+					req.DownloadCallback("", "", filepath.Dir(abs), abs)
 				}
 				internal.GetLogger().Info("end download file", "file", remoteFileName, "output", outputFile)
 				return nil
@@ -364,7 +371,7 @@ func (b *BaseOperate) BaseDownloadFile(req DownloadFileReq,
 	internal.GetLogger().Info("end download file", "file", remoteFileName, "output", outputFile)
 	if req.DownloadCallback != nil {
 		abs, _ := filepath.Abs(outputFile)
-		req.DownloadCallback(filepath.Dir(abs), abs)
+		req.DownloadCallback("", "", filepath.Dir(abs), abs)
 	}
 	return nil
 }

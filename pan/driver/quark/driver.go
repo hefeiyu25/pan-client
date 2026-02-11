@@ -91,6 +91,11 @@ func (q *Quark) Init() (string, error) {
 		SetCookieJar(jar).
 		SetTimeout(30 * time.Minute).SetBaseURL("https://drive.quark.cn/1/clouddrive")
 	q.defaultClient = req.C().SetTimeout(30 * time.Minute)
+	// 应用代理配置
+	if q.ProxyConfig.ProxyURL != "" {
+		q.sessionClient.SetProxyURL(q.ProxyConfig.ProxyURL)
+		q.defaultClient.SetProxyURL(q.ProxyConfig.ProxyURL)
+	}
 	// 若一小时内更新过，则不重新刷session
 	if q.Properties.RefreshTime == 0 || time.Now().UnixMilli()-q.Properties.RefreshTime > 60*60*1000 {
 		_, err = q.config()
@@ -349,17 +354,18 @@ func (q *Quark) Delete(req pan.DeleteReq) error {
 	return nil
 }
 
-func (q *Quark) UploadPath(req pan.UploadPathReq) error {
-	return q.BaseUploadPath(req, q.UploadFile)
+func (q *Quark) UploadPath(req pan.UploadPathReq) (*pan.TransferResult, error) {
+	err := q.BaseUploadPath(req, q.UploadFile)
+	return nil, err
 }
 
-func (q *Quark) UploadFile(req pan.UploadFileReq) error {
+func (q *Quark) UploadFile(req pan.UploadFileReq) (*pan.TransferResult, error) {
 	if req.Resumable {
 		internal.GetLogger().Warn("quark is not support resumeable")
 	}
 	stat, err := os.Stat(req.LocalFile)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	remoteName := stat.Name()
 	remotePath := strings.TrimRight(req.RemotePath, "/")
@@ -373,22 +379,22 @@ func (q *Quark) UploadFile(req pan.UploadFileReq) error {
 	_, err = q.GetPanObj(remoteAllPath, true, q.List)
 	// 没有报错证明文件已经存在
 	if err == nil {
-		return pan.CodeMsg(CodeObjectExist, remoteAllPath+" is exist")
+		return nil, pan.CodeMsg(CodeObjectExist, remoteAllPath+" is exist")
 	}
 	dir, err := q.Mkdir(pan.MkdirReq{
 		NewPath: remotePath,
 	})
 	if err != nil {
-		return pan.MsgError(remotePath+" create error", err)
+		return nil, pan.MsgError(remotePath+" create error", err)
 	}
 
 	md5Str, err := internal.GetFileMd5(req.LocalFile)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	sha1Str, err := internal.GetFileSha1(req.LocalFile)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	mimeType := internal.GetMimeType(req.LocalFile)
@@ -400,8 +406,12 @@ func (q *Quark) UploadFile(req pan.UploadFileReq) error {
 		MimeType: mimeType,
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
+
+	// 使用网盘返回的文件 ID
+	fileTaskId := pre.Data.Fid
+	result := &pan.TransferResult{TaskId: fileTaskId}
 
 	// hash
 	finish, err := q.FileUploadHash(FileUpHashReq{
@@ -410,11 +420,10 @@ func (q *Quark) UploadFile(req pan.UploadFileReq) error {
 		TaskId: pre.Data.TaskId,
 	})
 	if err != nil {
-		return err
+		return result, err
 	}
 	if finish.Data.Finish {
-		internal.GetLogger().Info("upload fast success", "file", req.LocalFile)
-		// 上传成功则移除文件了
+		internal.GetLogger().Info("upload fast success", "file", req.LocalFile, "fid", fileTaskId)
 		if req.SuccessDel {
 			err = os.Remove(req.LocalFile)
 			if err != nil {
@@ -423,12 +432,12 @@ func (q *Quark) UploadFile(req pan.UploadFileReq) error {
 				internal.GetLogger().Info("delete success", "file", req.LocalFile)
 			}
 		}
-		return nil
+		return result, nil
 	}
 
 	if req.OnlyFast {
 		internal.GetLogger().Info("upload fast error", "file", req.LocalFile)
-		return pan.OnlyMsg("only support fast error:" + req.LocalFile)
+		return result, pan.OnlyMsg("only support fast error:" + req.LocalFile)
 	}
 
 	// part up
@@ -438,7 +447,7 @@ func (q *Quark) UploadFile(req pan.UploadFileReq) error {
 	partNumber := 1
 	pr, err := pan.NewProcessReader(req.LocalFile, partSize, 0, req.ProgressCallback)
 	if err != nil {
-		return err
+		return result, err
 	}
 	md5s := make([]string, 0)
 	for left > 0 {
@@ -457,11 +466,10 @@ func (q *Quark) UploadFile(req pan.UploadFileReq) error {
 			Reader:     pr,
 		})
 		if e != nil {
-			return e
+			return result, e
 		}
 		if m == "finish" {
-			internal.GetLogger().Info("upload success", "file", req.LocalFile)
-			// 上传成功则移除文件了
+			internal.GetLogger().Info("upload success", "file", req.LocalFile, "fid", fileTaskId)
 			if req.SuccessDel {
 				err = os.Remove(req.LocalFile)
 				if err != nil {
@@ -470,7 +478,7 @@ func (q *Quark) UploadFile(req pan.UploadFileReq) error {
 					internal.GetLogger().Info("delete success", "file", req.LocalFile)
 				}
 			}
-			return nil
+			return result, nil
 		}
 		md5s = append(md5s, m)
 		partNumber++
@@ -486,17 +494,16 @@ func (q *Quark) UploadFile(req pan.UploadFileReq) error {
 		Callback:  pre.Data.Callback,
 	}, md5s)
 	if err != nil {
-		return err
+		return result, err
 	}
 	_, err = q.FileUpFinish(FileUpFinishReq{
 		ObjKey: pre.Data.ObjKey,
 		TaskId: pre.Data.TaskId,
 	})
 	if err != nil {
-		return err
+		return result, err
 	}
-	internal.GetLogger().Info("upload success", "file", req.LocalFile)
-	// 上传成功则移除文件了
+	internal.GetLogger().Info("upload success", "file", req.LocalFile, "fid", fileTaskId)
 	if req.SuccessDel {
 		err = os.Remove(req.LocalFile)
 		if err != nil {
@@ -505,20 +512,22 @@ func (q *Quark) UploadFile(req pan.UploadFileReq) error {
 			internal.GetLogger().Info("delete success", "file", req.LocalFile)
 		}
 	}
-	return nil
+	return result, nil
 }
 
-func (q *Quark) DownloadPath(req pan.DownloadPathReq) error {
-	return q.BaseDownloadPath(req, q.List, q.DownloadFile)
+func (q *Quark) DownloadPath(req pan.DownloadPathReq) (*pan.TransferResult, error) {
+	err := q.BaseDownloadPath(req, q.List, q.DownloadFile)
+	return nil, err
 }
-func (q *Quark) DownloadFile(req pan.DownloadFileReq) error {
-	return q.BaseDownloadFile(req, q.sessionClient, func(req pan.DownloadFileReq) (string, error) {
+func (q *Quark) DownloadFile(req pan.DownloadFileReq) (*pan.TransferResult, error) {
+	err := q.BaseDownloadFile(req, q.sessionClient, func(req pan.DownloadFileReq) (string, error) {
 		resp, err := q.fileDownload(req.RemoteFile.Id)
 		if err != nil {
 			return "", err
 		}
 		return resp.Data[0].DownloadUrl, nil
 	})
+	return nil, err
 }
 
 func (q *Quark) OfflineDownload(req pan.OfflineDownloadReq) (*pan.Task, error) {

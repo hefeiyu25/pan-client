@@ -80,6 +80,11 @@ func (c *Cloudreve) Init() (string, error) {
 				return rt.RoundTrip(req)
 			}
 		})
+	// 应用代理配置
+	if c.ProxyConfig.ProxyURL != "" {
+		c.sessionClient.SetProxyURL(c.ProxyConfig.ProxyURL)
+		c.defaultClient.SetProxyURL(c.ProxyConfig.ProxyURL)
+	}
 	// 若一小时内更新过，则不重新刷session
 	if c.Properties.RefreshTime == 0 || time.Now().UnixMilli()-c.Properties.RefreshTime > 60*60*1000 {
 		_, configErr := c.config()
@@ -338,11 +343,12 @@ func (c *Cloudreve) Delete(req pan.DeleteReq) error {
 	return nil
 }
 
-func (c *Cloudreve) UploadPath(req pan.UploadPathReq) error {
+func (c *Cloudreve) UploadPath(req pan.UploadPathReq) (*pan.TransferResult, error) {
 	if req.OnlyFast {
-		return pan.OnlyMsg("cloudreve is not support fast upload")
+		return nil, pan.OnlyMsg("cloudreve is not support fast upload")
 	}
-	return c.BaseUploadPath(req, c.UploadFile)
+	err := c.BaseUploadPath(req, c.UploadFile)
+	return nil, err
 }
 
 func (c *Cloudreve) uploadErrAfter(md5Key string, uploadedSize int64, session UploadCredential) {
@@ -367,13 +373,13 @@ func (c *Cloudreve) uploadErrAfter(md5Key string, uploadedSize int64, session Up
 	c.Set(cacheSessionErrPrefix+md5Key, i+1)
 }
 
-func (c *Cloudreve) UploadFile(req pan.UploadFileReq) error {
+func (c *Cloudreve) UploadFile(req pan.UploadFileReq) (*pan.TransferResult, error) {
 	if req.OnlyFast {
-		return pan.OnlyMsg("cloudreve is not support fast upload")
+		return nil, pan.OnlyMsg("cloudreve is not support fast upload")
 	}
 	stat, err := os.Stat(req.LocalFile)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	remoteName := stat.Name()
 	remotePath := strings.TrimRight(req.RemotePath, "/")
@@ -387,13 +393,13 @@ func (c *Cloudreve) UploadFile(req pan.UploadFileReq) error {
 	_, err = c.GetPanObj(remoteAllPath, true, c.List)
 	// 没有报错证明文件已经存在
 	if err == nil {
-		return pan.CodeMsg(CodeObjectExist, remoteAllPath+" is exist")
+		return nil, pan.CodeMsg(CodeObjectExist, remoteAllPath+" is exist")
 	}
 	_, err = c.Mkdir(pan.MkdirReq{
 		NewPath: remotePath,
 	})
 	if err != nil {
-		return pan.MsgError(remotePath+" create error", err)
+		return nil, pan.MsgError(remotePath+" create error", err)
 	}
 	md5Key := internal.Md5HashStr(remoteAllPath)
 	if !req.Resumable {
@@ -421,7 +427,6 @@ func (c *Cloudreve) UploadFile(req pan.UploadFileReq) error {
 		})
 		if e != nil {
 			if e.GetCode() == CodeConflictUploadOngoing {
-				// 要是存在重复的文件，直接删掉别的seesion再上传
 				_, _ = c.fileUploadDeleteAllUploadSession()
 				sResp, secE := c.fileUploadGetUploadSession(CreateUploadSessionReq{
 					Path:         "/" + remotePath,
@@ -440,11 +445,16 @@ func (c *Cloudreve) UploadFile(req pan.UploadFileReq) error {
 		return resp.Data, nil
 	})
 	if e != nil {
-		return e
+		return nil, e
 	}
 	if data != nil {
 		session = data.(UploadCredential)
 	}
+
+	// 使用 SessionID 作为文件任务 ID（Cloudreve 无预创建文件 ID）
+	fileTaskId := session.SessionID
+	result := &pan.TransferResult{TaskId: fileTaskId}
+
 	switch c.Properties.Type {
 	case Now61, Yiandrive, Wuaipan:
 		uploadedSize, err = c.notKnowUpload(NotKnowUploadReq{
@@ -453,11 +463,13 @@ func (c *Cloudreve) UploadFile(req pan.UploadFileReq) error {
 			LocalFile:        req.LocalFile,
 			UploadedSize:     uploadedSize,
 			ChunkSize:        int64(session.ChunkSize),
+			TaskId:           fileTaskId,
+			FileTaskId:       fileTaskId,
 			ProgressCallback: req.ProgressCallback,
 		})
 		if err != nil {
 			c.uploadErrAfter(md5Key, uploadedSize, session)
-			return err
+			return result, err
 		}
 	case Huang1111, Hefamily, Hucl:
 		uploadedSize, err = c.oneDriveUpload(OneDriveUploadReq{
@@ -465,20 +477,22 @@ func (c *Cloudreve) UploadFile(req pan.UploadFileReq) error {
 			LocalFile:        req.LocalFile,
 			UploadedSize:     uploadedSize,
 			ChunkSize:        min(int64(session.ChunkSize), c.Properties.ChunkSize),
+			TaskId:           fileTaskId,
+			FileTaskId:       fileTaskId,
 			ProgressCallback: req.ProgressCallback,
 		})
 		if err != nil {
 			c.uploadErrAfter(md5Key, uploadedSize, session)
-			return err
+			return result, err
 		}
 
 		_, err = c.oneDriveCallback(session.SessionID)
 		if err != nil {
 			c.uploadErrAfter(md5Key, uploadedSize, session)
-			return err
+			return result, err
 		}
 	default:
-		return pan.OnlyMsg("not support Type")
+		return result, pan.OnlyMsg("not support Type")
 	}
 
 	if req.Resumable {
@@ -486,8 +500,7 @@ func (c *Cloudreve) UploadFile(req pan.UploadFileReq) error {
 		c.Del(cacheChunkPrefix + md5Key)
 		c.Del(cacheSessionErrPrefix + md5Key)
 	}
-	internal.GetLogger().Info("upload success", "file", req.LocalFile)
-	// 上传成功则移除文件了
+	internal.GetLogger().Info("upload success", "file", req.LocalFile, "sessionId", fileTaskId)
 	if req.SuccessDel {
 		err = os.Remove(req.LocalFile)
 		if err != nil {
@@ -495,22 +508,23 @@ func (c *Cloudreve) UploadFile(req pan.UploadFileReq) error {
 		} else {
 			internal.GetLogger().Info("delete success", "file", req.LocalFile)
 		}
-
 	}
-	return nil
+	return result, nil
 }
 
-func (c *Cloudreve) DownloadPath(req pan.DownloadPathReq) error {
-	return c.BaseDownloadPath(req, c.List, c.DownloadFile)
+func (c *Cloudreve) DownloadPath(req pan.DownloadPathReq) (*pan.TransferResult, error) {
+	err := c.BaseDownloadPath(req, c.List, c.DownloadFile)
+	return nil, err
 }
-func (c *Cloudreve) DownloadFile(req pan.DownloadFileReq) error {
-	return c.BaseDownloadFile(req, c.defaultClient, func(req pan.DownloadFileReq) (string, error) {
+func (c *Cloudreve) DownloadFile(req pan.DownloadFileReq) (*pan.TransferResult, error) {
+	err := c.BaseDownloadFile(req, c.defaultClient, func(req pan.DownloadFileReq) (string, error) {
 		resp, err := c.fileCreateDownloadSession(req.RemoteFile.Id)
 		if err != nil {
 			return "", err
 		}
 		return resp.Data, nil
 	})
+	return nil, err
 }
 
 func (c *Cloudreve) OfflineDownload(req pan.OfflineDownloadReq) (*pan.Task, error) {

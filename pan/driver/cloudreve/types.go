@@ -308,6 +308,8 @@ type OneDriveUploadReq struct {
 	LocalFile        string
 	UploadedSize     int64
 	ChunkSize        int64
+	TaskId           string
+	FileTaskId       string
 	ProgressCallback pan.ProgressCallback
 }
 
@@ -317,5 +319,7 @@ type NotKnowUploadReq struct {
 	LocalFile        string
 	UploadedSize     int64
 	ChunkSize        int64
+	TaskId           string
+	FileTaskId       string
 	ProgressCallback pan.ProgressCallback
 }
