@@ -463,8 +463,9 @@ func (c *Cloudreve) UploadFile(req pan.UploadFileReq) (*pan.TransferResult, erro
 			LocalFile:        req.LocalFile,
 			UploadedSize:     uploadedSize,
 			ChunkSize:        int64(session.ChunkSize),
-			TaskId:           fileTaskId,
-			FileTaskId:       fileTaskId,
+			TaskId:           req.TaskId,
+			FileId:           fileTaskId,
+			Ctx:              req.Ctx,
 			ProgressCallback: req.ProgressCallback,
 		})
 		if err != nil {
@@ -477,8 +478,9 @@ func (c *Cloudreve) UploadFile(req pan.UploadFileReq) (*pan.TransferResult, erro
 			LocalFile:        req.LocalFile,
 			UploadedSize:     uploadedSize,
 			ChunkSize:        min(int64(session.ChunkSize), c.Properties.ChunkSize),
-			TaskId:           fileTaskId,
-			FileTaskId:       fileTaskId,
+			TaskId:           req.TaskId,
+			FileId:           fileTaskId,
+			Ctx:              req.Ctx,
 			ProgressCallback: req.ProgressCallback,
 		})
 		if err != nil {

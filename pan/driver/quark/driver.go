@@ -449,6 +449,14 @@ func (q *Quark) UploadFile(req pan.UploadFileReq) (*pan.TransferResult, error) {
 	if err != nil {
 		return result, err
 	}
+	if req.Ctx != nil {
+		pr.SetCtx(req.Ctx)
+	}
+	// Set IDs for progress events
+	if req.TaskId != "" {
+		pr.SetTaskId(req.TaskId)
+	}
+	pr.SetFileId(fileTaskId)
 	md5s := make([]string, 0)
 	for left > 0 {
 		start, end := pr.NextChunk()

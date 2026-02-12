@@ -379,11 +379,20 @@ func (tb *ThunderBrowser) UploadFile(req pan.UploadFileReq) (*pan.TransferResult
 		if err != nil {
 			return result, err
 		}
-		_, err = uploader.Upload(context.Background(), &s3.PutObjectInput{
+		uploadCtx := context.Background()
+		if req.Ctx != nil {
+			uploadCtx = req.Ctx
+		}
+		pw := pan.NewProgressWriter(req.LocalFile, stat.Size(), req.ProgressCallback)
+		if req.TaskId != "" {
+			pw.SetTaskId(req.TaskId)
+		}
+		pw.SetFileId(fileTaskId)
+		_, err = uploader.Upload(uploadCtx, &s3.PutObjectInput{
 			Bucket:  aws.String(param.Bucket),
 			Key:     aws.String(param.Key),
 			Expires: aws.Time(param.Expiration),
-			Body:    io.TeeReader(file, pan.NewProgressWriter(req.LocalFile, stat.Size(), req.ProgressCallback)),
+			Body:    io.TeeReader(file, pw),
 		})
 		_ = file.Close()
 		if err == nil && req.SuccessDel {

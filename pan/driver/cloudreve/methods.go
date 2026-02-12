@@ -395,6 +395,15 @@ func (c *Cloudreve) oneDriveUpload(req OneDriveUploadReq) (int64, pan.DriverErro
 	if err != nil {
 		return uploadedSize, err
 	}
+	if req.Ctx != nil {
+		pr.SetCtx(req.Ctx)
+	}
+	if req.TaskId != "" {
+		pr.SetTaskId(req.TaskId)
+	}
+	if req.FileId != "" {
+		pr.SetFileId(req.FileId)
+	}
 	for {
 		startSize, endSize := pr.NextChunk()
 		response, reqErr := c.defaultClient.R().SetBody(pr).
@@ -422,6 +431,15 @@ func (c *Cloudreve) notKnowUpload(req NotKnowUploadReq) (int64, pan.DriverErrorI
 	pr, err := pan.NewProcessReader(req.LocalFile, req.ChunkSize, uploadedSize, req.ProgressCallback)
 	if err != nil {
 		return uploadedSize, err
+	}
+	if req.Ctx != nil {
+		pr.SetCtx(req.Ctx)
+	}
+	if req.TaskId != "" {
+		pr.SetTaskId(req.TaskId)
+	}
+	if req.FileId != "" {
+		pr.SetFileId(req.FileId)
 	}
 	for {
 		startSize, endSize := pr.NextChunk()

@@ -1,6 +1,9 @@
 package pan
 
-import "time"
+import (
+	"context"
+	"time"
+)
 
 type Json map[string]interface{}
 
@@ -67,25 +70,27 @@ type TransferFileItem struct {
 
 // ProgressEvent 传输进度事件
 type ProgressEvent struct {
-	TaskId     string  // 任务 ID（目录级或文件级，来自网盘）
-	FileTaskId string  // 文件级 ID（目录任务时区分子文件）
-	FileName   string  // 当前文件名
-	Operated   int64   // 已传输字节
-	TotalSize  int64   // 总字节
-	Percent    float64 // 百分比 0-100
-	Speed      float64 // KB/s
-	Done       bool    // 是否完成
+	TaskId    string  // 调用方传入的任务 ID（可选）
+	FileId    string  // 网盘返回的文件 ID
+	FileName  string  // 当前文件名
+	Operated  int64   // 已传输字节
+	TotalSize int64   // 总字节
+	Percent   float64 // 百分比 0-100
+	Speed     float64 // KB/s
+	Done      bool    // 是否完成
 }
 
 // ProgressCallback 传输进度回调
 type ProgressCallback func(event ProgressEvent)
 
 type UploadFileReq struct {
-	LocalFile          string `json:"localFile,omitempty"`
-	RemotePath         string `json:"remotePath,omitempty"`
-	OnlyFast           bool   `json:"onlyFast,omitempty"`
-	Resumable          bool   `json:"resumable,omitempty"`
-	SuccessDel         bool   `json:"successDel,omitempty"`
+	LocalFile          string          `json:"localFile,omitempty"`
+	RemotePath         string          `json:"remotePath,omitempty"`
+	OnlyFast           bool            `json:"onlyFast,omitempty"`
+	Resumable          bool            `json:"resumable,omitempty"`
+	SuccessDel         bool            `json:"successDel,omitempty"`
+	TaskId             string          `json:"taskId,omitempty"` // 调用方传入的任务 ID（可选），回调中会包含
+	Ctx                context.Context `json:"-"`                // Per-upload context for cancellation
 	RemotePathTransfer RemoteTransfer
 	RemoteNameTransfer RemoteTransfer
 	ProgressCallback   ProgressCallback
@@ -128,12 +133,13 @@ type DownloadPathReq struct {
 }
 
 type DownloadFileReq struct {
-	RemoteFile       *PanObj `json:"remoteFile,omitempty"`
-	LocalPath        string  `json:"localPath,omitempty"`
-	Concurrency      int     `json:"concurrency,omitempty"`
-	ChunkSize        int64   `json:"chunkSize,omitempty"`
-	OverCover        bool    `json:"overCover,omitempty"`
-	TaskId           string  `json:"taskId,omitempty"` // 目录级任务 ID（由 DownloadPath 传入，单文件下载可留空）
+	RemoteFile       *PanObj         `json:"remoteFile,omitempty"`
+	LocalPath        string          `json:"localPath,omitempty"`
+	Concurrency      int             `json:"concurrency,omitempty"`
+	ChunkSize        int64           `json:"chunkSize,omitempty"`
+	OverCover        bool            `json:"overCover,omitempty"`
+	TaskId           string          `json:"taskId,omitempty"` // 目录级任务 ID（由 DownloadPath 传入，单文件下载可留空）
+	Ctx              context.Context `json:"-"`                // Per-download context; when set, overrides the driver-level Ctx for cancellation
 	DownloadCallback `json:"downloadCallback,omitempty"`
 	ProgressCallback ProgressCallback
 }

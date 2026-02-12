@@ -339,7 +339,9 @@ func (b *BaseOperate) BaseDownloadFile(req DownloadFileReq,
 		return err
 	}
 	var dlCtx []context.Context
-	if b.Ctx != nil {
+	if req.Ctx != nil {
+		dlCtx = append(dlCtx, req.Ctx)
+	} else if b.Ctx != nil {
 		dlCtx = append(dlCtx, b.Ctx)
 	}
 	cd := internal.NewChunkDownload(url, client).
@@ -351,8 +353,14 @@ func (b *BaseOperate) BaseDownloadFile(req DownloadFileReq,
 		SetMaxRetry(b.DownloadConfig.MaxRetry).
 		SetMaxThread(b.DownloadConfig.MaxThread)
 	if req.ProgressCallback != nil {
+		fileId := ""
+		if object != nil {
+			fileId = object.Id
+		}
 		cd.SetProgressFunc(func(fileName string, operated, totalSize int64, percent, speed float64, done bool) {
 			req.ProgressCallback(ProgressEvent{
+				TaskId:    req.TaskId,
+				FileId:    fileId,
 				FileName:  fileName,
 				Operated:  operated,
 				TotalSize: totalSize,
@@ -619,9 +627,17 @@ type ProgressReader struct {
 	startTime        time.Time
 	chunkStartTime   time.Time
 	progressCallback ProgressCallback
+	ctx              context.Context
+	taskId           string
+	fileId           string
 }
 
 func (pr *ProgressReader) Read(p []byte) (n int, err error) {
+	if pr.ctx != nil {
+		if err := pr.ctx.Err(); err != nil {
+			return 0, err
+		}
+	}
 	n, err = pr.readCloser.Read(p)
 	if n > 0 {
 		pr.currentUploaded += int64(n)
@@ -646,6 +662,8 @@ func (pr *ProgressReader) Read(p []byte) (n int, err error) {
 			}
 			percent := float64(uploaded) / float64(pr.totalSize) * 100
 			pr.progressCallback(ProgressEvent{
+				TaskId:    pr.taskId,
+				FileId:    pr.fileId,
 				FileName:  pr.file.Name(),
 				Operated:  uploaded,
 				TotalSize: pr.totalSize,
@@ -729,11 +747,28 @@ func NewProcessReader(localFile string, chunkSize, uploaded int64, progressCb ..
 	}, nil
 }
 
+// SetCtx sets a context for cancellation support on the reader.
+func (pr *ProgressReader) SetCtx(ctx context.Context) {
+	pr.ctx = ctx
+}
+
+// SetTaskId sets the task ID for progress events.
+func (pr *ProgressReader) SetTaskId(taskId string) {
+	pr.taskId = taskId
+}
+
+// SetFileId sets the file ID (from cloud storage) for progress events.
+func (pr *ProgressReader) SetFileId(fileId string) {
+	pr.fileId = fileId
+}
+
 type ProgressWriter struct {
 	startTime        time.Time
 	totalSize        int64
 	uploaded         int64
 	filename         string
+	taskId           string
+	fileId           string
 	progressCallback ProgressCallback
 }
 
@@ -750,6 +785,8 @@ func (pw *ProgressWriter) Write(b []byte) (n int, err error) {
 		percent := float64(pw.uploaded) / float64(pw.totalSize) * 100
 		done := pw.uploaded >= pw.totalSize
 		pw.progressCallback(ProgressEvent{
+			TaskId:    pw.taskId,
+			FileId:    pw.fileId,
 			FileName:  pw.filename,
 			Operated:  pw.uploaded,
 			TotalSize: pw.totalSize,
@@ -773,4 +810,14 @@ func NewProgressWriter(filename string, total int64, progressCb ...ProgressCallb
 		filename:         filename,
 		progressCallback: cb,
 	}
+}
+
+// SetTaskId sets the task ID for progress events.
+func (pw *ProgressWriter) SetTaskId(taskId string) {
+	pw.taskId = taskId
+}
+
+// SetFileId sets the file ID (from cloud storage) for progress events.
+func (pw *ProgressWriter) SetFileId(fileId string) {
+	pw.fileId = fileId
 }

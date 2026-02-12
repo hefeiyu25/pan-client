@@ -1,6 +1,7 @@
 package cloudreve
 
 import (
+	"context"
 	"github.com/hefeiyu25/pan-client/pan"
 	"time"
 )
@@ -308,8 +309,9 @@ type OneDriveUploadReq struct {
 	LocalFile        string
 	UploadedSize     int64
 	ChunkSize        int64
-	TaskId           string
-	FileTaskId       string
+	TaskId           string // 调用方传入的任务 ID（可选）
+	FileId           string // 网盘返回的文件 ID
+	Ctx              context.Context
 	ProgressCallback pan.ProgressCallback
 }
 
@@ -319,7 +321,8 @@ type NotKnowUploadReq struct {
 	LocalFile        string
 	UploadedSize     int64
 	ChunkSize        int64
-	TaskId           string
-	FileTaskId       string
+	TaskId           string // 调用方传入的任务 ID（可选）
+	FileId           string // 网盘返回的文件 ID
+	Ctx              context.Context
 	ProgressCallback pan.ProgressCallback
 }
